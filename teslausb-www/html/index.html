@@ -899,6 +899,11 @@ video {
             </svg>
           </span>
         </div>
+        <div class="status_upload_throughput" style="display:none;">
+          <span>Upload Speed: 
+            <span class="status_upload_throughput_info"></span>
+          </span>
+        </div>
         <div class="status_throttled"></div>
       </div>
       <button class="group2" id="toggledrives" onclick="toggledrivesfunc();">...</button>
@@ -1694,7 +1699,39 @@ function toggledrivesfunc() {
 }
 
 var statusvals;
+var last_tx_bytes_sample;
 const max_status_age = 4000;
+
+function update_upload_throughput() {
+  var div = document.querySelector(".status_upload_throughput");
+  var uptimediv = document.querySelector(".status_uptime");
+  if (isElementVisible(uptimediv) || uptimediv.clientHeight == 0) {
+    readfile({url:'cgi-bin/network_tx_bytes.sh', callback:function(value) {
+      var parts = value.trim().split(/\s+/);
+      var sample_ms = parseInt(parts[0]);
+      var tx_bytes = parseInt(parts[1]);
+      if (!isNaN(sample_ms) && !isNaN(tx_bytes)) {
+        if (last_tx_bytes_sample != undefined) {
+          var elapsed_ms = sample_ms - last_tx_bytes_sample.sample_ms;
+          var delta_bytes = tx_bytes - last_tx_bytes_sample.tx_bytes;
+          if (elapsed_ms > 0 && delta_bytes >= 0) {
+            var speed = (delta_bytes * 1000) / elapsed_ms;
+            div.style.display = "inherit";
+            var span = document.querySelector(".status_upload_throughput_info");
+            span.innerText = byteRate(speed) + " (" + bitRate(speed) + ")";
+          } else {
+            div.style.display = "none";
+          }
+        }
+        last_tx_bytes_sample = {tx_bytes: tx_bytes, sample_ms: sample_ms};
+      } else {
+        div.style.display = "none";
+        last_tx_bytes_sample = undefined;
+      }
+    }});
+  }
+  setTimeout(update_upload_throughput, 1000);
+}
 
 function updateuptimeonly() {
   if (statusvals != undefined) {
@@ -1909,6 +1946,7 @@ function initialize() {
   readfile({pre:'archivelooppre', url:'archiveloop.log', tail:true, button:'aldwnbtn'});
   readfile({pre:'setuplogpre', url:'teslausb-headless-setup.log', tail:true, button:'sudwnbtn'});
   showstatus();
+  update_upload_throughput();
   refreshdiagnostics();
 
   var settingsbtn = document.querySelector('.settingsbutton');
