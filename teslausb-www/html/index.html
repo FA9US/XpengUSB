@@ -1039,6 +1039,10 @@ video {
         <input type="checkbox" id="altui" name="altui" value="1">
         <label for="altui">Use alternative web interface</label>
       </div>
+      <div style="width:100%;padding:10px">
+        <input type="checkbox" id="disablepreloadvideoclips" name="disablepreloadvideoclips" value="1">
+        <label for="disablepreloadvideoclips">Disable preloading video clips</label>
+      </div>
       <div style="text-align:right;padding-top:30px;">
         <button onclick="cancelsettings()">Cancel</button> <button onclick="confirmsettings()">OK</button>
       </div>
@@ -1926,6 +1930,8 @@ function initialize() {
 function showsettings() {
   var altui = document.getElementById('altui');
   altui.checked = (localStorageGet("usealtui") == "true");
+  var disablepreloadvideoclips = document.getElementById('disablepreloadvideoclips');
+  disablepreloadvideoclips.checked = (localStorageGet("disablepreloadvideoclips") == "true");
   var overlay = document.getElementById("settingsoverlay");
   overlay.style.display = "block";
 }
@@ -1946,6 +1952,8 @@ function confirmsettings() {
     document.location.replace('/new/?source=legacy');
     nonExistentFunction();
   }
+  var disablepreloadvideoclips = document.getElementById('disablepreloadvideoclips').checked;
+  localStorageSet("disablepreloadvideoclips", disablepreloadvideoclips);
   closesettings();
 }
 
@@ -2965,7 +2973,9 @@ readfile({url:'cgi-bin/videolist.sh', callback:function(value) {
     }
   }
   if (newestsequence != undefined) {
-    newestsequence.select();
+    if (localStorageGet("disablepreloadvideoclips") != "true") {
+      newestsequence.select();
+    }
   }
   nr.innerHTML = "No recordings";
   initialize();
