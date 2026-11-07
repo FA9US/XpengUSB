@@ -32,6 +32,16 @@ Blind brand replacement would leave incompatible directory, filename, deletion a
 - **Linux integration:** workflow runs actual Btrfs/FAT/reflink and CIFS operations in a disposable runner. Consult the Actions run for the exact source commit and actual result; workflow presence alone is not verification.
 - **Not yet verified:** flashing/boot on original Zero W; USB enumeration and sustained 10 MB/s performance; G6 recording/playback under archive load; exact XOS behavior; actual NAS compatibility; overnight power; seven elapsed days and unexpected-power recovery.
 
+## Recorded automated result
+
+On 7 November 2026, [Actions run 42366444368](https://github.com/FA9US/XpengUSB/actions/runs/42366444368) passed for code commit [`30b5c24`](https://github.com/FA9US/XpengUSB/commit/30b5c24f094e914cb48f252191e4c779edaa4464):
+
+- All **74 tests passed** on each of Python 3.9, 3.11 and 3.12, with no skips on Linux.
+- Bash syntax checks and ShellCheck passed for both maintained shell scripts.
+- The disposable Linux integration passed real Btrfs reflinks, snapshot-only FAT repair and read-only mounts, SMB 3.1.1 publication/readback, filename reuse, seven-day expiry boundaries, and missing/wrong-mount guards.
+
+The integration exposed and helped fix an invalid GNU `cp` option combination: reflinks require `--sparse=auto`, not `--sparse=always`. It also required an isolated Samba fixture correction. These results cover the source and disposable runner, not a flashed Pi, the owner's NAS, seven elapsed days, or the vehicle.
+
 ## Remaining engineering limits
 
 1. No finite card can promise arbitrary seven-day recording volume. The conservative 128 GB layout has a limited retained-copy budget. See [architecture](ARCHITECTURE.md).

@@ -34,7 +34,7 @@ The G6 handbook specifies at least 32 GB and 10 MB/s write speed. Test the actua
 
 ### 1. Flash a fresh operating system
 
-Back up the microSD card. Flash **Raspberry Pi OS Lite (Legacy, 32-bit), Debian Bookworm** using [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Check the Debian version: menu labels can change. If Bookworm is absent, use the vendor's [Lite image archive](https://downloads.raspberrypi.com/raspios_lite_armhf/images/), choosing an image whose release notes identify Debian 12. Do not flash an upstream TeslaUSB image.
+Back up the microSD card. Flash **Raspberry Pi OS Lite (Legacy, 32-bit), Debian Bookworm** using [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Check the Debian version: menu labels can change. If Bookworm is absent in Imager, use the vendor's [manual downloads](https://www.raspberrypi.com/software/operating-systems/): choose **Legacy, 32-bit → Lite**, confirm **Debian 12 (bookworm)** and verify the published SHA-256 before selecting that image in Imager. Do not flash an upstream TeslaUSB image.
 
 In Imager, choose hostname `xpengusb`, create your own login/password or SSH key, enable SSH, and enter your home **2.4 GHz** Wi-Fi and country. Boot on a stable wall supply, away from the car, and let filesystem expansion finish.
 
