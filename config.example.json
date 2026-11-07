@@ -1,0 +1,13 @@
+{
+  "storage_dir": "/var/lib/xpengusb/storage",
+  "camera_image": "/var/lib/xpengusb/storage/cam.img",
+  "state_dir": "/var/lib/xpengusb/storage/state",
+  "spool_dir": "/var/lib/xpengusb/storage/spool",
+  "snapshot_dir": "/var/lib/xpengusb/storage/snapshots",
+  "nas_mount": "/mnt/xpengusb-nas",
+  "nas_source": "//nas.local/dashcam",
+  "credentials_file": "/etc/xpengusb/smb.credentials",
+  "archive_device_id": "GENERATED-BY-CONFIGURE",
+  "retention_days": 7,
+  "interval_seconds": 300
+}

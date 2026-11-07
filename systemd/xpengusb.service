@@ -1,0 +1,22 @@
+[Unit]
+Description=XpengUSB snapshot and NAS archive worker
+Requires=xpengusb-gadget.service
+After=xpengusb-gadget.service network.target
+RequiresMountsFor=/var/lib/xpengusb/storage
+ConditionPathExists=/etc/xpengusb/config.json
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/lib/xpengusb
+ExecStart=/usr/bin/python3 -m xpengusb.runtime --config /etc/xpengusb/config.json
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=60
+UMask=0077
+RuntimeDirectory=xpengusb
+RuntimeDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

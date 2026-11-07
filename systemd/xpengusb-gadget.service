@@ -1,0 +1,18 @@
+[Unit]
+Description=XpengUSB camera USB mass storage
+RequiresMountsFor=/var/lib/xpengusb/storage
+After=local-fs.target
+Before=xpengusb.service
+ConditionPathExists=/etc/xpengusb/config.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/xpengusb/scripts/gadget.sh start
+ExecStop=/usr/local/lib/xpengusb/scripts/gadget.sh stop
+TimeoutStartSec=30
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
