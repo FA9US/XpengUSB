@@ -76,6 +76,133 @@ else
     (( free_bytes >= CONTAINER_BYTES + RESERVE_BYTES )) || die 'Need at least 104 GiB free; use a fresh fully expanded 128 GB card.'
 fi
 
+if [[ -f /boot/firmware/config.txt ]]; then
+    boot_config=/boot/firmware/config.txt
+elif [[ -f /boot/config.txt ]]; then
+    boot_config=/boot/config.txt
+else
+    die 'Cannot locate the Raspberry Pi boot config.txt.'
+fi
+configure_boot_file() {
+python3 - "$boot_config" "$BASE/config.txt.before-install" "$1" <<'XPENGUSB_BOOT_CONFIG'
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+
+def plan_boot_config(text):
+    """Apply documented model filters for the original Pi Zero W only.
+
+    Fresh Bookworm includes a CM5-only host-mode dwc2 overlay. Model filters
+    replace each other; other filter types can combine, so uncertain active
+    overlays/includes require manual review rather than a guessed override.
+    https://www.raspberrypi.com/documentation/computers/config_txt.html#conditional-filters
+    """
+    zero_models = {"pi0", "pi0w"}
+    other_models = {"pi1", "pi2", "pi3", "pi3+", "pi4", "pi5", "pi400", "pi500",
+                    "cm0", "cm1", "cm3", "cm3+", "cm4", "cm4s", "cm5", "pi02"}
+    model_active, uncertain = True, False
+    overlays = []
+    for number, original in enumerate(text.splitlines(), 1):
+        line = original.split("#", 1)[0].strip()
+        section = re.fullmatch(r"\[([^\]]+)\]", line)
+        if section:
+            name = section.group(1).strip()
+            if name == "all":
+                model_active, uncertain = True, False
+            elif name in zero_models:
+                model_active = True
+            elif name in other_models:
+                model_active = False
+            else:
+                # Includes board-type, GPIO, serial, EDID, tryboot and none.
+                # We cannot determine their effective state on a fresh install.
+                model_active, uncertain = None, True
+            continue
+        if model_active is False:
+            continue
+        if re.match(r"include\s+", line):
+            raise ValueError(f"Boot config include on line {number} requires manual review.")
+        parameters = re.fullmatch(r"dtparam\s*=\s*(.*)", line)
+        if parameters and any(value.split("=", 1)[0].strip() == "dr_mode"
+                              for value in parameters.group(1).split(",")):
+            # dtparam can alter the most recently loaded overlay. Do not accept
+            # a later parameter override merely because dtoverlay looked safe.
+            raise ValueError(f"Active or conditional dtparam=dr_mode on line {number} requires manual review.")
+        overlay = re.fullmatch(r"dtoverlay\s*=\s*(.*)", line)
+        if not overlay:
+            continue
+        values = [value.strip() for value in overlay.group(1).split(",")]
+        if not values or values[0] != "dwc2":
+            continue
+        if uncertain or model_active is None:
+            raise ValueError(f"Conditional dwc2 overlay on line {number} requires manual review.")
+        if values != ["dwc2", "dr_mode=peripheral"]:
+            raise ValueError(f"Active Zero W dwc2 overlay on line {number} must use only dr_mode=peripheral.")
+        overlays.append(number)
+    if len(overlays) > 1:
+        raise ValueError("Multiple active Zero W dwc2 overlays require manual review.")
+    if overlays:
+        return text
+    return (text.rstrip("\n") + "\n\n# XpengUSB USB peripheral mode\n"
+            "[all]\n[pi0w]\ndtoverlay=dwc2,dr_mode=peripheral\n[all]\n")
+
+
+def configure_boot(path, backup):
+    if path.is_symlink() or not path.is_file() or backup.is_symlink():
+        raise ValueError("Refusing unexpected boot configuration or backup path.")
+    original = path.read_bytes()
+    updated = plan_boot_config(original.decode("utf-8")).encode("utf-8")
+    if updated == original:
+        print("Zero W USB peripheral boot configuration already correct.")
+        return
+    if not backup.exists():
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+    elif not backup.is_file():
+        raise ValueError("Boot configuration backup is not a regular file.")
+    fd, temporary = tempfile.mkstemp(prefix=".xpengusb-config-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print("Configured USB peripheral mode for the original Pi Zero W.")
+
+
+if __name__ == "__main__":
+    try:
+        path, backup = Path(sys.argv[1]), Path(sys.argv[2])
+        if path.is_symlink() or not path.is_file() or backup.is_symlink():
+            raise ValueError("Refusing unexpected boot configuration or backup path.")
+        if sys.argv[3] == "--check":
+            plan_boot_config(path.read_text(encoding="utf-8"))
+        elif sys.argv[3] == "--apply":
+            configure_boot(path, backup)
+        else:
+            raise ValueError("Invalid boot configuration operation.")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SystemExit("Boot configuration unchanged or requires inspection: " + str(error))
+XPENGUSB_BOOT_CONFIG
+}
+
+# Validate boot settings before package, storage, or boot-file changes.
+configure_boot_file --check
+
 # Reject conflicting fstab configuration before making any changes.
 python3 - "$CONTAINER" "$STORAGE" "$FSTAB_ENTRY" <<'PY'
 from pathlib import Path
@@ -198,20 +325,7 @@ if entry not in text.splitlines():
             os.unlink(temporary)
 PY
 
-if [[ -f /boot/firmware/config.txt ]]; then
-    boot_config=/boot/firmware/config.txt
-elif [[ -f /boot/config.txt ]]; then
-    boot_config=/boot/config.txt
-else
-    die 'Cannot locate the Raspberry Pi boot config.txt.'
-fi
-if ! grep -q '^dtoverlay=dwc2,dr_mode=peripheral$' "$boot_config"; then
-    if grep -Eq '^[[:space:]]*dtoverlay=dwc2([,[:space:]]|$)' "$boot_config"; then
-        die 'An existing dwc2 overlay needs review; set dr_mode=peripheral explicitly before retrying.'
-    fi
-    [[ -e $BASE/config.txt.before-install ]] || install -m 0600 "$boot_config" "$BASE/config.txt.before-install"
-    printf '\n# XpengUSB USB peripheral mode\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$boot_config"
-fi
+configure_boot_file --apply
 printf 'libcomposite\n' > /etc/modules-load.d/xpengusb.conf
 
 install -d -m 0755 "$DEST" "$DEST/xpengusb" "$DEST/scripts"

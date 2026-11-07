@@ -42,6 +42,8 @@ On 7 November 2026, [Actions run 42366444368](https://github.com/FA9US/XpengUSB/
 
 The integration exposed and helped fix an invalid GNU `cp` option combination: reflinks require `--sparse=auto`, not `--sparse=always`. It also required an isolated Samba fixture correction. These results cover the source and disposable runner, not a flashed Pi, the owner's NAS, seven elapsed days, or the vehicle.
 
+The subsequent installer review found that the [official Bookworm boot configuration](https://github.com/RPi-Distro/pi-gen/blob/bookworm/stage1/00-boot-files/files/config.txt) includes a CM5-only USB host overlay. The installer now evaluates Zero W model filters before allocating storage, preserves inactive model settings, and rejects active or ambiguous conflicts. Ten additional regression tests cover this behavior, bringing the suite to **84 tests**. Consult the [latest Actions result](https://github.com/FA9US/XpengUSB/actions/workflows/check.yml) for validation of the current revision.
+
 ## Remaining engineering limits
 
 1. No finite card can promise arbitrary seven-day recording volume. The conservative 128 GB layout has a limited retained-copy budget. See [architecture](ARCHITECTURE.md).
