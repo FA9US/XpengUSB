@@ -315,7 +315,7 @@ class Worker:
         work.mkdir(mode=0o700)
         (work / "mount").mkdir(mode=0o700)
         try:
-            self._run("cp", "--reflink=always", "--sparse=always", "--",
+            self._run("cp", "--reflink=always", "--sparse=auto", "--",
                       self.config.camera_image, work / "cam.img.part")
             os.replace(work / "cam.img.part", work / "cam.img")
         except BaseException:

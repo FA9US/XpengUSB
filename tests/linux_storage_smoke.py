@@ -152,7 +152,7 @@ class Fixture:
     def snapshot(self, store, identity):
         image = self.storage / ("snapshot-" + identity + ".img")
         before = digest(self.camera)
-        run("cp", "--reflink=always", "--sparse=always", "--", self.camera, image)
+        run("cp", "--reflink=always", "--sparse=auto", "--", self.camera, image)
         require(digest(image) == before, "Reflink does not match source")
         with self.image_mount(image, read_only=True) as target:
             result = store.ingest(target, snapshot_id=identity)
