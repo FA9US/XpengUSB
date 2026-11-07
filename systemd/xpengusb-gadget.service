@@ -10,7 +10,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/lib/xpengusb/scripts/gadget.sh start
 ExecStop=/usr/local/lib/xpengusb/scripts/gadget.sh stop
-TimeoutStartSec=30
+TimeoutStartSec=60
 TimeoutStopSec=30
 UMask=0077
 

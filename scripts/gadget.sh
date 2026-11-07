@@ -44,8 +44,15 @@ if [[ -d $GADGET ]]; then
     die 'An incomplete gadget exists; safe-eject the car, then stop the gadget service before retrying.'
 fi
 
-mapfile -t controllers < <(find /sys/class/udc -mindepth 1 -maxdepth 1 -type l -printf '%f\n')
-[[ ${#controllers[@]} -eq 1 ]] || die 'Expected exactly one USB device controller.'
+# On the Zero W, the service can start before udev loads the USB controller.
+modprobe dwc2
+shopt -s nullglob
+controllers=(/sys/class/udc/*)
+for ((attempt = 0; ${#controllers[@]} == 0 && attempt < 20; attempt++)); do
+    sleep 1
+    controllers=(/sys/class/udc/*)
+done
+[[ ${#controllers[@]} -eq 1 ]] || die 'Expected exactly one USB device controller after waiting for dwc2.'
 [[ -z $(find /sys/kernel/config/usb_gadget -mindepth 1 -maxdepth 1 -type d -print -quit) ]] || die 'Another USB gadget is configured.'
 
 mkdir "$GADGET"
@@ -70,5 +77,5 @@ printf '0\n' > "$GADGET/functions/mass_storage.0/lun.0/nofua"
 printf 'XpengUSB CAMERA 0001\n' > "$GADGET/functions/mass_storage.0/lun.0/inquiry_string"
 printf '%s\n' "$IMAGE" > "$GADGET/functions/mass_storage.0/lun.0/file"
 ln -s "$GADGET/functions/mass_storage.0" "$GADGET/configs/c.1/mass_storage.0"
-printf '%s\n' "${controllers[0]}" > "$GADGET/UDC"
+printf '%s\n' "${controllers[0]##*/}" > "$GADGET/UDC"
 printf 'XpengUSB camera USB gadget connected.\n'
