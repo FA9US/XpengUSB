@@ -163,7 +163,7 @@ class Fixture:
     def start_samba(self):
         samba_root = self.root / "samba"
         samba_root.mkdir()
-        for name in ("lock", "state", "cache", "private", "pid", "share"):
+        for name in ("lock", "state", "cache", "private", "pid", "ncalrpc", "share"):
             (samba_root / name).mkdir()
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -183,6 +183,7 @@ class Fixture:
     cache directory = {samba_root / 'cache'}
     private dir = {samba_root / 'private'}
     pid directory = {samba_root / 'pid'}
+    ncalrpc dir = {samba_root / 'ncalrpc'}
     log file = {samba_root / 'samba.log'}
     load printers = no
     disable spoolss = yes
@@ -199,11 +200,17 @@ class Fixture:
 """, encoding="utf-8")
         run("testparm", "--suppress-prompt", configuration)
         self.log = (samba_root / "foreground.log").open("wb")
-        self.samba = subprocess.Popen(["smbd", "--foreground", "--no-process-group", "--configfile", str(configuration)],
-                                      stdout=self.log, stderr=self.log, start_new_session=True)
+        # Foreground smbd watches stdin pipes for EOF and treats it as parent
+        # death. Keep a private pipe open instead of inheriting CI's closed stdin.
+        # https://github.com/samba-team/samba/blob/master/source3/smbd/server.c
+        self.samba = subprocess.Popen(["smbd", "--foreground", "--no-process-group",
+                                      "--debug-stdout", "--debuglevel=3", "--configfile", str(configuration)],
+                                      stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
+                                      start_new_session=True)
         deadline = time.monotonic() + 15
         while True:
-            require(self.samba.poll() is None, "Isolated Samba process exited; inspect " + str(samba_root))
+            returncode = self.samba.poll()
+            require(returncode is None, f"Isolated Samba exited with code {returncode}; fixture logs follow")
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.3):
                     break
@@ -218,6 +225,23 @@ class Fixture:
                    "nodev,nosuid,noexec,cache=none,actimeo=0,uid=0,gid=0,file_mode=0600,dir_mode=0700")
         run("mount", "-t", "cifs", self.source, self.nas_mount, "-o", options)
         verify_archive_mount(self.nas_mount, self.source)
+
+    def diagnostics(self):
+        """Keep bounded synthetic-only Samba evidence before fixture cleanup."""
+        if self.samba is not None:
+            print("Isolated smbd return code: " + str(self.samba.poll()), file=sys.stderr)
+        if self.log is not None and not self.log.closed:
+            self.log.flush()
+        for name in ("foreground.log", "samba.log", "log.smbd"):
+            path = self.root / "samba" / name
+            if not path.is_file() or path.is_symlink():
+                continue
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 16384))
+                tail = stream.read().decode("utf-8", errors="replace")
+            print(f"--- isolated Samba {name} (last 80 lines, at most 16 KiB) ---", file=sys.stderr)
+            print("\n".join(tail.splitlines()[-80:]), file=sys.stderr)
 
     def cleanup(self):
         # Never use lazy/forced unmount or recursively delete a mounted tree.
@@ -241,6 +265,8 @@ class Fixture:
             except ProcessLookupError:
                 pass
             self.samba.wait(timeout=15)
+            if self.samba.stdin is not None:
+                self.samba.stdin.close()
         if self.log is not None:
             self.log.close()
         require(not any(item.target.is_relative_to(self.root) for item in read_mounts()), "Refusing cleanup: a test mount remains")
@@ -313,6 +339,9 @@ def main():
     fixture = Fixture()
     try:
         exercise(fixture)
+    except BaseException:
+        fixture.diagnostics()
+        raise
     finally:
         try:
             fixture.cleanup()
