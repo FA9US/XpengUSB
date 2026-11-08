@@ -1,0 +1,21 @@
+[Unit]
+Description=XpengUSB local HTTPS dashboard
+Requires=xpengusb-dashboard.socket
+After=xpengusb-dashboard.socket
+
+[Service]
+User=xpengusb-web
+Group=xpengusb-web
+WorkingDirectory=/usr/local/lib/xpengusb
+ExecStart=/usr/bin/python3 -m xpengusb.dashboard
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

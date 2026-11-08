@@ -1,0 +1,13 @@
+[Unit]
+Description=XpengUSB dashboard settings request
+
+[Service]
+Type=oneshot
+WorkingDirectory=/usr/local/lib/xpengusb
+ExecStart=/usr/bin/python3 -m xpengusb.dashboard_control request
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+TimeoutStartSec=120

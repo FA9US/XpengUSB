@@ -1,0 +1,14 @@
+[Unit]
+Description=XpengUSB local dashboard control socket
+
+[Socket]
+ListenStream=/run/xpengusb-dashboard.sock
+SocketUser=root
+SocketGroup=xpengusb-web
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -101,6 +101,8 @@ For updates, safely eject from the car, shut down, move the Pi to stable wall po
 
 ## Development
 
+For phone access after the base setup, see the optional [dashboard and fallback hotspot](docs/DASHBOARD.md).
+
 ```sh
 python3 -m unittest discover -s tests -v
 bash -n install.sh scripts/gadget.sh

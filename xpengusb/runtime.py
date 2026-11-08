@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -49,6 +50,7 @@ class Config:
     archive_device_id: str
     retention_days: int = 7
     interval_seconds: int = 300
+    nas_directory: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
@@ -82,6 +84,12 @@ class Config:
             raise RuntimeSafetyError("NAS mount cannot overlap recorder storage")
         if not re.fullmatch(r"//[A-Za-z0-9._-]+/[^/\\,\x00-\x1f]+", self.nas_source):
             raise RuntimeSafetyError("nas_source must be //hostname/share")
+        if (not isinstance(self.nas_directory, str) or len(self.nas_directory) > 240
+                or self.nas_directory and any(
+                    not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,79}", part)
+                    or part.endswith((" ", "."))
+                    for part in self.nas_directory.split("/"))):
+            raise RuntimeSafetyError("Use a relative NAS subfolder such as cars/dashcam.")
         if any(char in str(self.credentials_file) for char in (",", "\n", "\r")):
             raise RuntimeSafetyError("Invalid credential file path")
         try:
@@ -95,7 +103,7 @@ class Config:
 
     @property
     def archive_root(self) -> Path:
-        return self.nas_mount / "XpengUSB" / self.archive_device_id
+        return self.nas_mount / self.nas_directory / "XpengUSB" / self.archive_device_id
 
 
 @dataclass(frozen=True)
@@ -215,7 +223,7 @@ class Worker:
                   timeout=45)
         self._verify_nas()
 
-    def archive(self, now: float) -> None:
+    def archive(self, now: float) -> dict:
         self._verify_nas()
         # The store timestamps each completed verified transfer. Never pass a
         # cycle-start timestamp: copying over Wi-Fi can take hours.
@@ -226,11 +234,12 @@ class Worker:
         now = self.trusted_time()
         if now is None:
             LOG.warning("Retention deferred: clock no longer synchronized")
-            return
-        result = self.store.prune(self.config.archive_root,
-                                 expected_source=self.config.nas_source, now=now,
-                                 max_files=ARCHIVE_BATCH_FILES)
-        LOG.info("Retention: %s", result)
+        else:
+            retention = self.store.prune(self.config.archive_root,
+                                         expected_source=self.config.nas_source, now=now,
+                                         max_files=ARCHIVE_BATCH_FILES)
+            LOG.info("Retention: %s", retention)
+        return result
 
     def _check_storage(self) -> int:
         config = self.config
@@ -361,7 +370,7 @@ class Worker:
         image.unlink()
         work.rmdir()
 
-    def capture(self) -> None:
+    def capture(self) -> dict:
         reserve = self._check_storage()
         work = self._workspace(reserve)
         image, target = work / "cam.img", work / "mount"
@@ -399,6 +408,11 @@ class Worker:
                 self._check_snapshot_mount(work, loop)
             result = self.store.ingest(target, snapshot_id=work.name, min_free_bytes=reserve)
             LOG.info("Snapshot ingestion: %s", result)
+            try:
+                usage = shutil.disk_usage(target)
+            except OSError:
+                return {}
+            return {"usb_disk": {"total": usage.total, "free": usage.free}}
         except Exception:
             LOG.warning("Snapshot ingestion failed; committed spool is retained. "
                         "This snapshot will be released after a safe unmount; "
@@ -421,7 +435,9 @@ class Worker:
         # the first snapshot indefinitely. A failed capture (including low
         # space) must still permit uploading and pruning retained footage.
         try:
-            self.capture()
+            capture = self.capture()
+            if capture:
+                outcomes.update(capture)
             outcomes["capture"] = "completed"
         except Exception as exc:
             outcomes["capture"] = str(exc)
@@ -432,7 +448,9 @@ class Worker:
                 outcomes["archive"] = "waiting for synchronized clock"
             else:
                 self.ensure_nas()
-                self.archive(now)
+                upload = self.archive(now)
+                if upload:
+                    outcomes["uploaded"] = upload["archived"]
                 outcomes["archive"] = "completed"
         except Exception as exc:
             outcomes["archive"] = str(exc)
@@ -487,6 +505,12 @@ def main(argv=None) -> int:
                 worker = Worker(config, store)
                 while True:
                     result = worker.cycle()
+                    if Path("/etc/xpengusb/wifi.json").exists():
+                        try:
+                            from .dashboard_control import record_cycle
+                            record_cycle(config, store, result)
+                        except Exception:
+                            LOG.warning("Could not refresh dashboard status")
                     if args.once:
                         print(json.dumps(result, indent=2))
                         return 0 if result.get("capture") == "completed" else 1

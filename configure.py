@@ -14,6 +14,7 @@ import uuid
 
 CONFIG_DIR = Path("/etc/xpengusb")
 CONFIG_PATH = CONFIG_DIR / "config.json"
+SMB_CREDENTIAL_FILES = (CONFIG_DIR / "smb.credentials", CONFIG_DIR / "smb.next.credentials")
 FIXED_PATHS = {
     "storage_dir": "/var/lib/xpengusb/storage",
     "camera_image": "/var/lib/xpengusb/storage/cam.img",
@@ -76,10 +77,15 @@ def default_config(existing=None):
     })
     if existing:
         for key, value in FIXED_PATHS.items():
-            if existing.get(key) != value:
+            allowed = tuple(path.as_posix() for path in SMB_CREDENTIAL_FILES
+                            ) if key == "credentials_file" else (value,)
+            if existing.get(key) not in allowed:
                 raise ValueError("Existing configuration has an unexpected " + key + ".")
+        config["credentials_file"] = existing["credentials_file"]
         config["archive_device_id"] = str(uuid.UUID(existing["archive_device_id"]))
         config["nas_source"] = existing["nas_source"]
+        if "nas_directory" in existing:
+            config["nas_directory"] = existing["nas_directory"]
     return config
 
 

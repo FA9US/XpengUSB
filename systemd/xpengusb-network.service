@@ -1,0 +1,12 @@
+[Unit]
+Description=XpengUSB fallback Wi-Fi and notifications
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/usr/local/lib/xpengusb
+ExecStart=/usr/bin/python3 -m xpengusb.dashboard_control network
+UMask=0077
+NoNewPrivileges=yes
+TimeoutStartSec=100

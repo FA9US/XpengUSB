@@ -1,0 +1,10 @@
+[Unit]
+Description=Check XpengUSB Wi-Fi and pending notifications
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=20s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

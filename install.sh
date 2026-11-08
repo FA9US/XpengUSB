@@ -333,7 +333,8 @@ find "$SOURCE/xpengusb" -maxdepth 1 -type f -name '*.py' -exec install -m 0644 '
 install -m 0755 "$SOURCE/configure.py" "$DEST/configure.py"
 install -m 0755 "$SOURCE/scripts/gadget.sh" "$DEST/scripts/gadget.sh"
 install -m 0644 "$SOURCE/systemd/xpengusb-gadget.service" "$SOURCE/systemd/xpengusb.service" /etc/systemd/system/
-if [[ ! -f /etc/xpengusb/config.json || ! -f /etc/xpengusb/smb.credentials ]]; then
+if [[ ! -f /etc/xpengusb/config.json ||
+      ( ! -f /etc/xpengusb/smb.credentials && ! -f /etc/xpengusb/smb.next.credentials ) ]]; then
     [[ -t 0 ]] || die 'Run interactively to enter NAS credentials privately.'
     python3 "$DEST/configure.py"
 fi
@@ -342,18 +343,21 @@ fi
     python3 - <<'PY'
 import json, os, stat
 from pathlib import Path
+from configure import SMB_CREDENTIAL_FILES
 from xpengusb.runtime import Config
 path = Path("/etc/xpengusb/config.json")
 if path.is_symlink() or not path.is_file():
     raise SystemExit("Configuration file must be an ordinary private file.")
-for item in (path, Path("/etc/xpengusb/smb.credentials")):
+try:
+    config = Config.from_dict(json.loads(path.read_text(encoding="utf-8")))
+except (ValueError, TypeError, KeyError) as error:
+    raise SystemExit("Existing configuration is invalid; run configure.py before retrying.") from error
+if config.credentials_file not in SMB_CREDENTIAL_FILES:
+    raise SystemExit("Unexpected SMB credentials path.")
+for item in (path, config.credentials_file):
     info = item.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
         raise SystemExit("Configuration and credentials must be root-owned with mode 0600.")
-try:
-    Config.from_dict(json.loads(path.read_text(encoding="utf-8")))
-except (ValueError, TypeError, KeyError) as error:
-    raise SystemExit("Existing configuration is invalid; run configure.py before retrying.") from error
 PY
 )
 systemctl daemon-reload
