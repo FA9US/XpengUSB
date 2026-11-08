@@ -27,7 +27,7 @@ class DashboardRequests(unittest.TestCase):
         self.addCleanup(connection.close)
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if auth:
-            headers["Authorization"] = "Basic test"
+            headers["Authorization"] = auth if isinstance(auth, str) else "Basic test"
         connection.request(method, path, body, headers)
         response = connection.getresponse()
         response.read()
@@ -52,6 +52,15 @@ class DashboardRequests(unittest.TestCase):
         with patch.object(dashboard.Dashboard, "show", respond):
             self.assertEqual(self.request("POST", "/retry", "csrf=" + dashboard.CSRF), 200)
         broker.assert_called_once_with("retry", {})
+
+    @patch.object(dashboard, "broker", return_value={"version": 1, "id": "test"})
+    def test_ha_token_is_separate_and_limited_to_ha_actions(self, broker):
+        with patch.object(dashboard, "HA_AUTH", b"Bearer test"):
+            self.assertEqual(self.request("GET", "/api/v1/ha-status"), 401)
+            self.assertEqual(self.request("GET", "/", auth="Bearer test"), 401)
+            self.assertEqual(self.request("POST", "/api/v1/nas", auth="Bearer test"), 404)
+            self.assertEqual(self.request("GET", "/api/v1/ha-status", auth="Bearer test"), 200)
+        broker.assert_called_once_with("ha-status", {})
 
 
 class WifiFallback(unittest.TestCase):

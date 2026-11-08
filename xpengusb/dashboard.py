@@ -1,5 +1,6 @@
 """HTTPS dashboard. All privileged operations go through the local broker."""
 import base64
+import hashlib
 import hmac
 import html
 from http import HTTPStatus
@@ -16,6 +17,8 @@ WEB = Path("/etc/xpengusb-web")
 SOCKET = "/run/xpengusb-dashboard.sock"
 CSRF = secrets.token_urlsafe(32)
 AUTH = b""
+HA_AUTH = b""
+HA_POSTS = {"ha-test-nas", "ha-test-pushover", "ha-sync", "ha-pushover-on", "ha-pushover-off", "ha-arrival"}
 
 
 def broker(action, fields):
@@ -40,10 +43,12 @@ def field(name, label, value="", *, secret=False, hint=""):
             f'placeholder="{escape(hint)}" maxlength="512" autocomplete="off"></label>')
 
 
-def form(action, content, button):
+def form(action, content, button, test_label=""):
+    test = (f'<button class="secondary" formaction="/test-{action}">{escape(test_label)}</button>'
+            if test_label else "")
     return (f'<form method="post" action="/{action}">'
             f'<input type="hidden" name="csrf" value="{CSRF}">{content}'
-            f'<button>{escape(button)}</button></form>')
+            f'<button>{escape(button)}</button>{test}</form>')
 
 
 def card(title, content):
@@ -93,7 +98,7 @@ def render(status, message=""):
                    + field("username", "SMB username", nas["username"])
                    + field("domain", "Domain (optional)", nas["domain"])
                    + field("password", "SMB password", secret=True, hint="Leave blank to keep it"),
-                   "Save NAS settings"))
+                   "Save NAS settings", "Test NAS"))
     enabled = status["pushover"]
     result += card("Pushover",
                    "<p>Receive one message when the upload queue clears, plus persistent backup problems.</p>"
@@ -103,7 +108,10 @@ def render(status, message=""):
                           + field("token", "Application token", secret=True, hint="Leave blank to keep it")
                           + field("user", "User key", secret=True, hint="Leave blank to keep it")
                           + field("device", "Phone device name (optional)", status.get("pushover_device", "")),
-                          "Save notifications"))
+                          "Save notifications", "Send test notification"))
+    if HA_AUTH:
+        result += card("Home Assistant",
+                       "<p><a href='/home-assistant'>Show private pairing details</a></p>")
     return ("<!doctype html><html lang=en><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<title>XpengUSB</title><style>"
@@ -119,6 +127,7 @@ def render(status, message=""):
             "input,select{box-sizing:border-box;width:100%;margin-top:.25rem;background:#10161b;"
             "color:#edf5f3;border:1px solid #647a80}button{background:#8cf0ca;color:#10161b;border:0;"
             "margin-top:.45rem;cursor:pointer}form+form{margin-top:.5rem}"
+            "button.secondary{background:#35444b;color:#edf5f3;margin-left:.5rem}"
             ".notice{padding:.8rem;border:1px solid #8cf0ca;border-radius:7px}"
             "</style><main><header><h1>XpengUSB</h1><a href='/'>Refresh</a></header>"
             + (f'<p class="notice" role="status">{escape(message)}</p>' if message else "")
@@ -132,10 +141,10 @@ class Dashboard(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # URLs, credentials and request details are deliberately excluded from logs.
 
-    def respond(self, status, body, *, authenticate=False):
+    def respond(self, status, body, *, authenticate=False, content_type="text/html; charset=utf-8"):
         data = body.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -164,16 +173,40 @@ class Dashboard(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.OK, page)
 
     def do_GET(self):
+        if self.path == "/api/v1/ha-status":
+            self.api("ha-status")
+            return
         if self.authorized():
             if self.path == "/":
                 self.show()
+            elif self.path == "/home-assistant" and HA_AUTH:
+                der = ssl.PEM_cert_to_DER_cert((WEB / "cert.pem").read_text())
+                fingerprint = hashlib.sha256(der).hexdigest()
+                token = HA_AUTH.removeprefix(b"Bearer ").decode()
+                self.respond(HTTPStatus.OK, "<!doctype html><html lang=en><meta charset=utf-8>"
+                             "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                             "<title>XpengUSB pairing</title><style>"
+                             "body{font:16px system-ui;margin:1.4rem;background:#10161b;color:#edf5f3}"
+                             "code{overflow-wrap:anywhere}a{color:#8cf0ca}</style>"
+                             "<h1>Home Assistant pairing</h1>"
+                             f"<p>Token</p><code>{escape(token)}</code>"
+                             f"<p>SHA-256 certificate fingerprint</p><code>{fingerprint}</code>"
+                             "<p><a href='/'>Back to dashboard</a></p></html>")
             else:
                 self.respond(HTTPStatus.NOT_FOUND, "Page not found.")
 
     def do_POST(self):
+        if self.path.startswith("/api/v1/"):
+            action = self.path.removeprefix("/api/v1/")
+            if action in HA_POSTS:
+                self.api(action)
+            else:
+                self.respond(HTTPStatus.NOT_FOUND, "Page not found.")
+            return
         if not self.authorized():
             return
-        if self.path not in ("/home", "/hotspot", "/retry", "/nas", "/pushover"):
+        if self.path not in ("/home", "/hotspot", "/retry", "/nas", "/pushover",
+                             "/test-nas", "/test-pushover"):
             self.respond(HTTPStatus.NOT_FOUND, "Page not found.")
             return
         try:
@@ -193,14 +226,28 @@ class Dashboard(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, "Invalid settings form.")
             return
         try:
-            broker(self.path[1:], {key: value[0] for key, value in pairs.items()})
-            message = ("Saved. The next network check will apply the Wi-Fi change."
+            result = broker(self.path[1:], {key: value[0] for key, value in pairs.items()})
+            message = result.get("message") or ("Saved. The next network check will apply the Wi-Fi change."
                        if self.path in ("/home", "/hotspot", "/retry") else "Settings saved.")
             self.show(message)
         except ValueError as error:
             self.show(str(error))
         except OSError:
             self.respond(HTTPStatus.SERVICE_UNAVAILABLE, "The settings service did not respond.")
+
+    def api(self, action):
+        supplied = self.headers.get("Authorization", "").encode("utf-8")
+        if not HA_AUTH or not hmac.compare_digest(supplied, HA_AUTH):
+            status, response = HTTPStatus.UNAUTHORIZED, {"error": "Invalid Home Assistant token."}
+        else:
+            try:
+                response = broker(action, {})
+                status = HTTPStatus.OK
+            except ValueError as error:
+                status, response = HTTPStatus.BAD_REQUEST, {"error": str(error)}
+            except OSError:
+                status, response = HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Pi control service unavailable."}
+        self.respond(status, json.dumps(response), content_type="application/json")
 
 
 class SecureServer(HTTPServer):
@@ -215,9 +262,12 @@ class SecureServer(HTTPServer):
 
 
 def main():
-    global AUTH
+    global AUTH, HA_AUTH
     password = (WEB / "password").read_text().strip()
     AUTH = b"Basic " + base64.b64encode(("admin:" + password).encode())
+    token = WEB / "ha-token"
+    if token.is_file():
+        HA_AUTH = b"Bearer " + token.read_text().strip().encode()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(WEB / "cert.pem", WEB / "key.pem")

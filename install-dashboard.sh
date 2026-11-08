@@ -43,16 +43,19 @@ install -d -m 0750 -o root -g xpengusb-web "$web"
 if [[ ! -e $web/password ]]; then
     python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > "$web/password"
 fi
+if [[ ! -e $web/ha-token ]]; then
+    python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$web/ha-token"
+fi
 if [[ ! -e $web/cert.pem || ! -e $web/key.pem ]]; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -sha256 -nodes -days 825 -subj '/CN=xpengusb.local' \
         -addext 'subjectAltName=DNS:xpengusb.local,IP:10.42.0.1' \
         -keyout "$web/key.pem" -out "$web/cert.pem"
 fi
-chown root:xpengusb-web "$web/password" "$web/key.pem" "$web/cert.pem"
-chmod 0640 "$web/password" "$web/key.pem" "$web/cert.pem"
+chown root:xpengusb-web "$web/password" "$web/key.pem" "$web/cert.pem" "$web/ha-token"
+chmod 0640 "$web/password" "$web/key.pem" "$web/cert.pem" "$web/ha-token"
 
-for module in dashboard dashboard_control notify runtime; do
+for module in dashboard dashboard_control nas_probe notify runtime; do
     install -m 0644 "xpengusb/$module.py" "$destination/xpengusb/$module.py"
 done
 install -m 0755 configure.py "$destination/configure.py"
@@ -69,6 +72,7 @@ install -m 0644 systemd/xpengusb-dashboard.socket systemd/xpengusb-dashboard@.se
     /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now xpengusb-dashboard.socket xpengusb-web.service xpengusb-network.timer
+systemctl restart xpengusb-web.service
 if $restart_worker; then
     systemctl restart xpengusb.service
 else

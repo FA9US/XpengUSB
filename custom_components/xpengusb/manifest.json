@@ -1,0 +1,11 @@
+{
+  "domain": "xpengusb",
+  "name": "XpengUSB",
+  "codeowners": ["@FA9US"],
+  "config_flow": true,
+  "documentation": "https://github.com/FA9US/XpengUSB/blob/main/docs/HOME_ASSISTANT.md",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/FA9US/XpengUSB/issues",
+  "version": "0.1.0"
+}

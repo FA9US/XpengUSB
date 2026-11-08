@@ -2,6 +2,7 @@
 import json
 import time
 from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .dashboard_control import PUSHOVER, STATE, SYNC_STATUS, read_json, write_json
@@ -20,13 +21,35 @@ def send(credentials, title, message):
     if credentials.get("device"):
         data["device"] = credentials["device"]
     request = Request("https://api.pushover.net/1/messages.json", data=urlencode(data).encode())
-    with build_opener(NoRedirect()).open(request, timeout=8) as response:
-        if json.loads(response.read(16384)).get("status") != 1:
-            raise ValueError("Pushover rejected the request.")
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=8) as response:
+            if json.loads(response.read(16384)).get("status") != 1:
+                raise ValueError("Pushover rejected the request.")
+    except HTTPError as error:
+        with error:
+            detail = error.read(8192).decode("utf-8", "replace").lower()
+        if error.code == 429:
+            message = "Pushover rate limit or message quota reached. Try again later."
+        elif error.code >= 500:
+            message = "Pushover is temporarily unavailable."
+        elif "token" in detail:
+            message = "Pushover rejected the application token."
+        elif "device" in detail:
+            message = "Pushover rejected the device name. Check the device or leave it blank."
+        elif "user" in detail:
+            message = "Pushover rejected the user key."
+        else:
+            message = "Pushover rejected the notification. Check the token, user key and device."
+        raise ValueError(message) from error
+    except (URLError, TimeoutError) as error:
+        raise ValueError("The Pi could not reach Pushover over HTTPS. Check internet access.") from error
 
 
 def tick(client):
     if not client or not PUSHOVER.exists():
+        return
+    credentials = read_json(PUSHOVER, {})
+    if not credentials or not credentials.get("enabled", True):
         return
     status = read_json(SYNC_STATUS, {})
     if not status.get("cycle"):
@@ -57,7 +80,7 @@ def tick(client):
     state["retry_after"] = now + 900
     write_json(STATE_FILE, state)
     try:
-        send(read_json(PUSHOVER), title, message)
+        send(credentials, title, message)
     except (OSError, ValueError):
         print("Pushover delivery failed. Check credentials, device and internet access.", flush=True)
         return

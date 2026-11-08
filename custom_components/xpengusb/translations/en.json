@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect XpengUSB",
+        "description": "Use the Pi's local HTTPS dashboard address, Home Assistant token and SHA-256 certificate fingerprint. If you select a parked sensor, it must be On for an arrival alert.",
+        "data": {
+          "url": "Dashboard HTTPS URL",
+          "token": "Pi Home Assistant token",
+          "fingerprint": "SHA-256 certificate fingerprint",
+          "arrival_alert": "Send a Pushover alert after five minutes back on home Wi-Fi",
+          "parked_entity": "Vehicle parked binary sensor (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_settings": "Check the HTTPS URL, token and SHA-256 fingerprint.",
+      "invalid_auth": "The Pi rejected the Home Assistant token.",
+      "cannot_connect": "Cannot reach the Pi, verify its certificate, or read its API."
+    },
+    "abort": {
+      "already_configured": "This recorder is already configured."
+    }
+  }
+}

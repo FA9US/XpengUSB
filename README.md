@@ -103,6 +103,8 @@ For updates, safely eject from the car, shut down, move the Pi to stable wall po
 
 For phone access after the base setup, see the optional [dashboard and fallback hotspot](docs/DASHBOARD.md).
 
+For backup controls, recorder status and delayed home Wi-Fi arrival alerts, see the [Home Assistant and HACS setup](docs/HOME_ASSISTANT.md).
+
 ```sh
 python3 -m unittest discover -s tests -v
 bash -n install.sh scripts/gadget.sh

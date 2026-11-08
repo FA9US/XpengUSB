@@ -169,14 +169,12 @@ def nas_credentials(path):
                 if "=" in line)
 
 
-def set_nas(fields):
+def nas_settings(fields):
     config = read_json(CONFIG_PATH)
     current = Config.from_dict(config)
     credentials = current.credentials_file
     if credentials not in SMB_CREDENTIAL_FILES:
         raise ValueError("Unexpected SMB credentials path.")
-    replacement = next(path for path in SMB_CREDENTIAL_FILES if path != credentials)
-    old_config = CONFIG_PATH.read_text(encoding="utf-8")
     previous = nas_credentials(credentials)
     config["nas_source"] = nas_source(fields["server"].strip(), fields["share"].strip())
     config["nas_directory"] = fields["directory"].strip()
@@ -189,11 +187,46 @@ def set_nas(fields):
               "domain": fields["domain"].strip()}
     for key, value in values.items():
         validate_credential(value, key.capitalize(), allow_empty=(key == "domain"))
-    config["credentials_file"] = str(replacement)
     try:
         Config.from_dict(config)
     except RuntimeSafetyError as error:
         raise ValueError(str(error)) from error
+    return config, current, "".join(f"{k}={v}\n" for k, v in values.items() if v)
+
+
+def saved_nas_fields():
+    config = Config.from_dict(read_json(CONFIG_PATH))
+    server, share = config.nas_source[2:].split("/", 1)
+    credentials = nas_credentials(config.credentials_file)
+    return {"server": server, "share": share, "directory": config.nas_directory,
+            "username": credentials.get("username", ""), "domain": credentials.get("domain", ""),
+            "password": ""}
+
+
+def test_nas(fields):
+    config, _, credentials = nas_settings(fields)
+    request = dict(source=config["nas_source"], directory=config["nas_directory"],
+                   credentials=credentials, device_id=config["archive_device_id"])
+    try:
+        result = subprocess.run(
+            ["unshare", "--mount", "--propagation", "private", sys.executable, "-m", "xpengusb.nas_probe"],
+            input=json.dumps(request), text=True, capture_output=True, timeout=38, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("The NAS test timed out. Check Wi-Fi, NAS availability and TCP port 445.") from error
+    if result.returncode:
+        raise ValueError("The Pi could not start the isolated SMB test.")
+    response = json.loads(result.stdout)
+    if "error" in response:
+        raise ValueError(response["error"])
+    return response
+
+
+def set_nas(fields):
+    old_config = CONFIG_PATH.read_text(encoding="utf-8")
+    config, current, contents = nas_settings(fields)
+    credentials = current.credentials_file
+    replacement = next(path for path in SMB_CREDENTIAL_FILES if path != credentials)
+    config["credentials_file"] = str(replacement)
     run("systemctl", "stop", "xpengusb.service", timeout=70)
     changed = False
     try:
@@ -204,7 +237,7 @@ def set_nas(fields):
         if mounts:
             run("umount", "--", str(current.nas_mount), timeout=20)
         changed = True
-        atomic_private_write(replacement, "".join(f"{k}={v}\n" for k, v in values.items() if v))
+        atomic_private_write(replacement, contents)
         write_json(CONFIG_PATH, config)
         run("systemctl", "start", "--no-block", "xpengusb.service")
     except Exception:
@@ -253,26 +286,93 @@ def dashboard_status():
         counts = ArchiveStore.read_status(config.state_dir) if mounted else {}
     except (OSError, RuntimeError, sqlite3.Error):
         counts = {}
+    push = read_json(PUSHOVER, {})
     return {"os_disk": disk_usage("/"), "storage_disk": disk_usage(config.storage_dir) if mounted else {},
             "counts": counts, "sync": read_json(SYNC_STATUS, {}),
             "network": read_json(WIFI_STATUS, {}), "home_ssid": wifi["home_ssid"],
             "ap_ssid": wifi["ap_ssid"], "nas": {"server": server, "share": share,
             "directory": config.nas_directory,
             "username": creds.get("username", ""), "domain": creds.get("domain", "")},
-            "pushover": PUSHOVER.exists(), "pushover_device": read_json(PUSHOVER, {}).get("device", "")}
+            "pushover": bool(push and push.get("enabled", True)), "pushover_device": push.get("device", "")}
 
 
-def save_push(fields):
-    if fields.get("enabled") != "1":
-        PUSHOVER.unlink(missing_ok=True)
-        return
+def push_settings(fields):
     old = read_json(PUSHOVER, {})
     token, user = (fields[key].strip() or old.get(key, "") for key in ("token", "user"))
     device = fields["device"].strip()
     if (not all(re.fullmatch(r"[A-Za-z0-9]{30}", value) for value in (token, user))
             or not re.fullmatch(r"[A-Za-z0-9_-]{0,25}", device)):
         raise ValueError("Check the Pushover application token, user key and optional device name.")
-    write_json(PUSHOVER, {"token": token, "user": user, "device": device})
+    return {"token": token, "user": user, "device": device, "enabled": fields["enabled"] == "1"}
+
+
+def save_push(fields):
+    if fields["enabled"] == "0" and not PUSHOVER.exists() and not (fields["token"] or fields["user"]):
+        return
+    write_json(PUSHOVER, push_settings(fields))
+
+
+def send_push_test(settings):
+    from .notify import send
+    guard = Path("/run/xpengusb-push-test.json")
+    now = time.monotonic()
+    if now - read_json(guard, {"time": -60})["time"] < 10:
+        raise ValueError("Wait 10 seconds before sending another test notification.")
+    write_json(guard, {"time": now})
+    send(settings, "XpengUSB test", "Your XpengUSB test notification reached Pushover.")
+    return {"message": "Pushover accepted the test notification. Check your phone."}
+
+
+def ha_status():
+    config = Config.from_dict(read_json(CONFIG_PATH))
+    wifi = read_json(WIFI)
+    sync = read_json(SYNC_STATUS, {})
+    network = read_json(WIFI_STATUS, {})
+    push = read_json(PUSHOVER, {})
+    # Return only status and non-secret settings. The snapshot and counts are
+    # produced by the worker; a Home Assistant poll never scans recordings.
+    return {"version": 1, "id": config.archive_device_id, "os_disk": disk_usage("/"),
+            "storage_disk": disk_usage(config.storage_dir)
+            if any(m.target == config.storage_dir and m.fstype == "btrfs" for m in read_mounts()) else {},
+            "usb_disk": sync.get("usb_disk", {}),
+            **{key: sync.get(key) for key in ("recordings", "pending", "archived", "last_success", "last_upload")},
+            "sync": sync.get("archive", "Waiting for a cycle"), "network": network.get("mode", "Starting"),
+            "connected_ssid": network.get("ssid", ""), "home_ssid": wifi["home_ssid"],
+            "hotspot_ssid": wifi["ap_ssid"], "nas_destination": config.nas_source +
+            ("/" + config.nas_directory if config.nas_directory else ""),
+            "pushover_enabled": bool(push and push.get("enabled", True))}
+
+
+def ha_action(action):
+    if action == "ha-status":
+        return ha_status()
+    if action == "ha-test-nas":
+        return test_nas(saved_nas_fields())
+    if action == "ha-sync":
+        if run("systemctl", "is-active", "--quiet", "xpengusb.service", check=False).returncode:
+            raise ValueError("The archive worker is stopped.")
+        Path("/run/xpengusb/sync-request").touch()
+        return {"message": "Sync requested. The worker will finish its current cycle first."}
+    push = read_json(PUSHOVER, {})
+    if not push:
+        raise ValueError("Save Pushover credentials in the Pi dashboard first.")
+    if action == "ha-test-pushover":
+        return send_push_test(push)
+    if action == "ha-arrival":
+        if not push.get("enabled", True):
+            raise ValueError("Pushover alerts are disabled.")
+        from .notify import send
+        guard = Path("/run/xpengusb-arrival.json")
+        now = time.monotonic()
+        if now - read_json(guard, {"time": -900})["time"] < 600:
+            return {"message": "A recent arrival notification was already accepted."}
+        send(push, "XpengUSB back on home Wi-Fi",
+             "The recorder has been connected to home Wi-Fi for five minutes.")
+        write_json(guard, {"time": now})
+        return {"message": "Pushover accepted the arrival notification."}
+    push["enabled"] = action == "ha-pushover-on"
+    write_json(PUSHOVER, push)
+    return {}
 
 
 FORMS = {
@@ -281,6 +381,10 @@ FORMS = {
     "nas": {"server", "share", "directory", "username", "password", "domain"},
     "pushover": {"token", "user", "device", "enabled"},
 }
+FORMS.update({"test-nas": FORMS["nas"], "test-pushover": FORMS["pushover"]})
+HA_ACTIONS = {"ha-status", "ha-test-nas", "ha-test-pushover", "ha-sync", "ha-pushover-on",
+              "ha-pushover-off", "ha-arrival"}
+FORMS.update({action: set() for action in HA_ACTIONS})
 
 
 def dispatch(request):
@@ -291,6 +395,12 @@ def dispatch(request):
         raise ValueError("Invalid dashboard request.")
     if action == "status":
         return dashboard_status()
+    if action in HA_ACTIONS:
+        return ha_action(action)
+    if action == "test-nas":
+        return test_nas(fields)
+    if action == "test-pushover":
+        return send_push_test(push_settings(fields))
     if action == "nas":
         set_nas(fields)
     elif action == "pushover":
@@ -325,7 +435,7 @@ def main():
             if len(payload) > 8192 or not payload.endswith(b"\n"):
                 raise ValueError("Invalid dashboard request.")
             request = json.loads(payload)
-            if isinstance(request, dict) and request.get("action") == "status":
+            if isinstance(request, dict) and request.get("action") in ("status", "ha-status"):
                 print(json.dumps({"result": dispatch(request)}), flush=True)
                 return
         except (ValueError, OSError, KeyError, TypeError):

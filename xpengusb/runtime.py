@@ -504,6 +504,8 @@ def main(argv=None) -> int:
                               retention_days=config.retention_days) as store:
                 worker = Worker(config, store)
                 while True:
+                    sync_request = lock_dir / "sync-request"
+                    sync_request.unlink(missing_ok=True)
                     result = worker.cycle()
                     if Path("/etc/xpengusb/wifi.json").exists():
                         try:
@@ -514,7 +516,15 @@ def main(argv=None) -> int:
                     if args.once:
                         print(json.dumps(result, indent=2))
                         return 0 if result.get("capture") == "completed" else 1
-                    time.sleep(config.interval_seconds)
+                    if not Path("/etc/xpengusb/wifi.json").exists():
+                        time.sleep(config.interval_seconds)
+                    else:
+                        next_cycle = time.monotonic() + config.interval_seconds
+                        while not sync_request.exists():
+                            remaining = next_cycle - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(remaining, 2))
     except Exception as exc:
         LOG.error("Worker stopped: %s", exc)
         return 1
