@@ -1,10 +1,12 @@
 """Regression checks for the HA access boundary and arrival timing."""
 import importlib.util
+import io
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
-from xpengusb import dashboard_control
+from xpengusb import dashboard_control, notify
 from xpengusb.nas_probe import mount_problem
 
 spec = importlib.util.spec_from_file_location(
@@ -55,9 +57,19 @@ class ProbeErrors(unittest.TestCase):
 
     @patch.object(dashboard_control, "send_push_test", return_value={"message": "accepted"})
     @patch.object(dashboard_control, "save_push")
-    def test_test_button_does_not_save_and_accepts_disabled_notifications(self, save, send):
+    @patch.object(dashboard_control, "read_json", return_value={})
+    def test_test_button_does_not_save_and_accepts_disabled_notifications(self, read, save, send):
         fields = {"enabled": "0", "device": "phone", "token": "a" * 30, "user": "b" * 30}
         self.assertEqual(dashboard_control.dispatch({"action": "test-pushover", "fields": fields}),
                          {"message": "accepted"})
         save.assert_not_called()
         send.assert_called_once_with({"enabled": False, "device": "phone", "token": "a" * 30, "user": "b" * 30})
+
+    @patch.object(notify, "build_opener")
+    def test_pushover_error_explains_rejection_without_echoing_service_body(self, opener):
+        opener.return_value.open.side_effect = HTTPError(
+            "https://api.pushover.net/1/messages.json", 400, "bad request", {},
+            io.BytesIO(b'{"errors":["application token invalid: secret-value"]}'),
+        )
+        with self.assertRaisesRegex(ValueError, "^Pushover rejected the application token\\.$"):
+            notify.send({"token": "test", "user": "test"}, "Test", "Test")
