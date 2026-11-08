@@ -2,7 +2,7 @@
 
 **Automatic USB recording backup for the XPENG G6, built for a Raspberry Pi Zero W.**
 
-Record in the car. Come home to Wi-Fi. Keep verified copies on your NAS.
+Record in the car. Come home to Wi-Fi. Keep verified copies on your NAS. including webGui en Hacs integration to home-Assistent.
 
 > **Development preview — vehicle testing required.** This is an independent adaptation of [TeslaUSB](https://github.com/marcone/teslausb), not an XPENG product. The target is a 2025 G6 with XOS 5.9.5.8906, an original Pi Zero W and a 128 GB microSD card. Software tests do not establish USB compatibility or recording reliability. Keep your working USB drive available until the [acceptance tests](docs/TESTING.md) pass.
 
