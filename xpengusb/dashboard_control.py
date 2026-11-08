@@ -114,13 +114,17 @@ def set_profile(ssid, password, ap):
         raise
 
 
-def setup_wifi():
+def setup_wifi(password_stdin=False):
     if WIFI.exists():
         return
     current = active_wifi()
     if not current:
         raise ValueError("Connect the Pi to home Wi-Fi before installing the dashboard.")
-    set_profile("XpengUSB", getpass.getpass("Initial XpengUSB hotspot password (hidden): "), True)
+    if password_stdin:
+        password = sys.stdin.readline(129).rstrip("\r\n")
+    else:
+        password = getpass.getpass("Initial XpengUSB hotspot password (hidden): ")
+    set_profile("XpengUSB", password, True)
     write_json(WIFI, {"home": current, "home_ssid": wifi_ssid(current),
                      "ap_ssid": "XpengUSB", "action": "", "last_retry": 0})
 
@@ -313,6 +317,7 @@ def main():
     import fcntl
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("request", "network", "setup"))
+    parser.add_argument("--password-stdin", action="store_true")
     args = parser.parse_args()
     if args.mode == "request":
         try:
@@ -329,7 +334,7 @@ def main():
     with open("/run/xpengusb-dashboard.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.mode == "setup":
-            setup_wifi()
+            setup_wifi(args.password_stdin)
         elif args.mode == "network":
             client = network_tick()
             from .notify import tick

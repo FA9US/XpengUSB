@@ -2,7 +2,7 @@
 
 Install this add-on after the base XpengUSB setup works. It runs on the original Zero W without a second radio, container, web framework or remote account. The recorder and archive work without the dashboard.
 
-1. Safely eject the recorder, shut down, and move the Pi to desk power. Connect it to home Wi-Fi.
+1. Connect the Pi to home Wi-Fi and keep it powered for setup. The recorder's USB gadget can stay connected. The installer only restarts the archive worker. If a copy is in progress, use `--defer-worker-restart` and run `sudo systemctl restart xpengusb.service` between archive cycles.
 2. From the reviewed checkout, run:
 
    ~~~bash
