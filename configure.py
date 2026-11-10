@@ -43,6 +43,15 @@ def validate_credential(value, name, allow_empty=False):
     return value
 
 
+def parse_retention_days(value):
+    """Zero enables verified-copy cleanup; the default remains seven days."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,3}", value.strip()):
+        value = int(value.strip())
+    if type(value) is not int or not 0 <= value <= 365:
+        raise ValueError("Local retention must be 0 through 365 days; 0 clears verified local copies.")
+    return value
+
+
 def atomic_private_write(path, content):
     """Replace only an ordinary owned config file, with a durable 0600 file."""
     if path.parent.is_symlink() or path.is_symlink() or (path.exists() and not path.is_file()):
@@ -84,6 +93,7 @@ def default_config(existing=None):
         config["credentials_file"] = existing["credentials_file"]
         config["archive_device_id"] = str(uuid.UUID(existing["archive_device_id"]))
         config["nas_source"] = existing["nas_source"]
+        config["retention_days"] = parse_retention_days(existing.get("retention_days", 7))
         if "nas_directory" in existing:
             config["nas_directory"] = existing["nas_directory"]
     return config
@@ -111,6 +121,9 @@ def configure():
     server = input("NAS hostname [" + parts[0] + "]: ").strip() or parts[0]
     share = input("SMB share [" + parts[1] + "]: ").strip() or parts[1]
     config["nas_source"] = nas_source(server, share)
+    retention = input("Local retention days (0 = clear after verified NAS backup) ["
+                      + str(config["retention_days"]) + "]: ").strip()
+    config["retention_days"] = parse_retention_days(retention or config["retention_days"])
     username = validate_credential(input("NAS username [xpeng]: ").strip() or "xpeng", "Username")
     password = validate_credential(getpass.getpass("NAS password (hidden): "), "Password")
     domain = validate_credential(input("SMB domain (usually blank): ").strip(), "Domain", True)
@@ -120,7 +133,13 @@ def configure():
     atomic_private_write(Path(config["credentials_file"]), credentials)
     atomic_private_write(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
     print("Saved private configuration. No NAS connection or service start was made.")
-    print("Seven-day retention starts after each verified NAS copy. Device ID: " + config["archive_device_id"])
+    if config["retention_days"] == 0:
+        print("Local copies become eligible for cleanup after NAS verification; "
+              "cleanup rechecks the NAS copy before deleting local data.")
+    else:
+        print("Local copies stay at least " + str(config["retention_days"])
+              + " day(s) after verified NAS backup; cleanup rechecks the NAS copy.")
+    print("Device ID: " + config["archive_device_id"])
 
 
 def main():

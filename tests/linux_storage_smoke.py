@@ -314,6 +314,20 @@ def exercise(fixture):
                 "Local pruning modified NAS archive")
         require(digest(fixture.camera) == rewritten, "Retention modified original camera image")
 
+        with ArchiveStore(fixture.storage / "zero-state", fixture.storage / "zero-spool",
+                          retention_days=0) as zero_store:
+            fixture.snapshot(zero_store, "zero-first")
+            fixture.snapshot(zero_store, "zero-second")
+            zero_root = fixture.nas_mount / "XpengUSB" / str(uuid.uuid4())
+            require(zero_store.archive_to(zero_root, expected_source=fixture.source,
+                                         now=3000)["archived"] == 2, "Zero-day upload failed")
+            require(zero_store.prune(zero_root, expected_source=fixture.source, now=3000)["pruned"] == 2,
+                    "Verified zero-day copies were not cleared immediately")
+            require(zero_store.status()["retained"] == 0, "Zero-day cleanup left a retained copy")
+            require({path.read_bytes() for path in zero_root.rglob("*.mp4")} == {mp4(b"BBBB"), mp4(b"EVENT")},
+                    "Zero-day cleanup changed a NAS copy")
+            require(digest(fixture.camera) == rewritten, "Zero-day cleanup modified the camera image")
+
         run("umount", fixture.nas_mount)
         try:
             store.archive_to(archive_root, expected_source=fixture.source, now=2001 + 7 * DAY)

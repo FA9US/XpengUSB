@@ -55,7 +55,7 @@ fi
 chown root:xpengusb-web "$web/password" "$web/key.pem" "$web/cert.pem" "$web/ha-token"
 chmod 0640 "$web/password" "$web/key.pem" "$web/cert.pem" "$web/ha-token"
 
-for module in dashboard dashboard_control nas_probe notify runtime; do
+for module in archive dashboard dashboard_control nas_probe notify runtime; do
     install -m 0644 "xpengusb/$module.py" "$destination/xpengusb/$module.py"
 done
 install -m 0755 configure.py "$destination/configure.py"
@@ -70,13 +70,16 @@ install -m 0755 configure.py "$destination/configure.py"
 install -m 0644 systemd/xpengusb-dashboard.socket systemd/xpengusb-dashboard@.service \
     systemd/xpengusb-web.service systemd/xpengusb-network.service systemd/xpengusb-network.timer \
     /etc/systemd/system/
+if $restart_worker; then
+    install -m 0644 systemd/xpengusb.service /etc/systemd/system/
+fi
 systemctl daemon-reload
 systemctl enable --now xpengusb-dashboard.socket xpengusb-web.service xpengusb-network.timer
 systemctl restart xpengusb-web.service
 if $restart_worker; then
     systemctl restart xpengusb.service
 else
-    echo 'Restart xpengusb.service between archive cycles to enable dashboard recording status.'
+    echo 'Rerun this installer between archive cycles to update the worker unit and restart it.'
 fi
 printf '\nDashboard: https://xpengusb.local:8443 (hotspot: https://10.42.0.1:8443)\n'
 printf 'Login user: admin. Read the unique password privately with sudo cat %s/password\n' "$web"

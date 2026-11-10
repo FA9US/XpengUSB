@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from configure import (CONFIG_PATH, SMB_CREDENTIAL_FILES, atomic_private_write,
+from configure import (CONFIG_PATH, FIXED_PATHS, SMB_CREDENTIAL_FILES, atomic_private_write,
                        nas_source, validate_credential)
 from .archive import ArchiveStore
 from .runtime import Config, RuntimeSafetyError, read_mounts
@@ -254,25 +254,48 @@ def disk_usage(path):
     return {"total": usage.f_blocks * usage.f_frsize, "free": usage.f_bavail * usage.f_frsize}
 
 
+def system_headroom(storage_dir, free):
+    if storage_dir != Path(FIXED_PATHS["storage_dir"]):
+        return None
+    try:
+        image = (STATE / "storage.btrfs").stat()
+        if image.st_dev == Path("/").stat().st_dev:
+            return max(0, free - max(0, image.st_size - image.st_blocks * 512))
+    except OSError:
+        pass
+    return None
+
+
 def record_cycle(config, store, result):
     status = read_json(SYNC_STATUS, {})
     destination = config.nas_source + "/" + config.nas_directory
     if status.get("destination") != destination:
         status = {}
     now = time.time()
-    counts = ArchiveStore.read_status(config.state_dir)
-    status.update(cycle=time.time_ns(), destination=destination,
-                  capture=result["capture"], archive=result["archive"],
-                  archived=counts["archived"], pending=counts["pending"])
+    counts = store.status()
+    previous_archived = status.get("archived", counts["archived"])
+    status.update(destination=destination, archived=counts["archived"],
+                  pending=counts["pending"], pending_bytes=counts.get("pending_bytes", 0))
+    for key in ("phase", "capture", "capture_checked", "archive", "archive_attempt", "retention"):
+        if key in result:
+            status[key] = result[key]
+    archive = result.get("archive")
+    if archive and archive not in {"completed", "waiting for synchronized clock"}:
+        status["archive_failure"] = result.get("archive_attempt", time.time_ns())
+        status["archive_failure_reason"] = archive
+    if result.get("phase", "idle") == "idle":
+        status["cycle"] = time.time_ns()
+    if "capture_checked" in result:
+        status["skipped_capacity"] = result.get("skipped_capacity", 0)
     if "usb_disk" in result:
         status["usb_disk"] = result["usb_disk"]
         status["recordings"] = store.db.execute(
             "SELECT COUNT(*) FROM candidates WHERE lower(relative) GLOB '*.mp4'"
         ).fetchone()[0]
-    if result["archive"] == "completed":
+    if result.get("archive") == "completed":
         status["last_success"] = now
-    if result.get("uploaded"):
-        status["last_upload"] = now
+    if counts["archived"] > previous_archived:
+        status["last_upload"] = store.db.execute("SELECT MAX(verified_at) FROM clips").fetchone()[0]
     write_json(SYNC_STATUS, status)
 
 
@@ -287,7 +310,10 @@ def dashboard_status():
     except (OSError, RuntimeError, sqlite3.Error):
         counts = {}
     push = read_json(PUSHOVER, {})
-    return {"os_disk": disk_usage("/"), "storage_disk": disk_usage(config.storage_dir) if mounted else {},
+    os_disk = disk_usage("/")
+    return {"os_disk": os_disk, "storage_disk": disk_usage(config.storage_dir) if mounted else {},
+            "system_headroom": system_headroom(config.storage_dir, os_disk["free"]),
+            "retention_days": config.retention_days,
             "counts": counts, "sync": read_json(SYNC_STATUS, {}),
             "network": read_json(WIFI_STATUS, {}), "home_ssid": wifi["home_ssid"],
             "ap_ssid": wifi["ap_ssid"], "nas": {"server": server, "share": share,
@@ -335,7 +361,8 @@ def ha_status():
             "storage_disk": disk_usage(config.storage_dir)
             if any(m.target == config.storage_dir and m.fstype == "btrfs" for m in read_mounts()) else {},
             "usb_disk": sync.get("usb_disk", {}),
-            **{key: sync.get(key) for key in ("recordings", "pending", "archived", "last_success", "last_upload")},
+            **{key: sync.get(key) for key in ("recordings", "pending", "pending_bytes", "archived",
+                                             "last_success", "last_upload", "capture", "phase")},
             "sync": sync.get("archive", "Waiting for a cycle"), "network": network.get("mode", "Starting"),
             "connected_ssid": network.get("ssid", ""), "home_ssid": wifi["home_ssid"],
             "hotspot_ssid": wifi["ap_ssid"], "nas_destination": config.nas_source +

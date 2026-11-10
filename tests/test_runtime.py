@@ -2,17 +2,19 @@
 
 import json
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
 
 from xpengusb.runtime import (Config, GIB, Mount, RuntimeSafetyError, Worker,
-                              main, parse_mountinfo)
+                              archive_delay, main, parse_mountinfo)
 
 # Scale storage units in controller tests: these are fixture files, not disk
 # performance or real sparse-file tests. Windows truncate can allocate zeros.
@@ -236,6 +238,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((work / "cam.img").exists())
         self.assertFalse(any(cmd[0] == "cp" for cmd in self.runner.calls))
 
+    def test_zero_day_retention_is_valid_configuration(self):
+        config = Config.from_dict(dict(self.config_dict, retention_days=0))
+        self.assertEqual(config.retention_days, 0)
+
     def test_low_space_does_not_block_nas_copy_and_retention(self):
         self.add_nas()
         self.worker.free_bytes = lambda path: 39 * GIB
@@ -273,6 +279,48 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(expected_remaining, backlog["expired"])
         self.assertEqual(["ingest", "archive", "prune"] * 2,
                          [call[0] for call in self.store.calls])
+
+    def test_upload_only_cycle_reports_attempt_without_rescanning_camera(self):
+        self.add_nas()
+        progress = []
+        result = self.worker.cycle(capture_due=False, report=progress.append)
+        self.assertEqual(["archive", "prune"], [call[0] for call in self.store.calls])
+        self.assertNotIn("capture", result)
+        self.assertEqual("uploading", progress[0]["phase"])
+        self.assertEqual(progress[0]["archive_attempt"], result["archive_attempt"])
+        self.assertEqual("idle", result["phase"])
+        self.assertEqual((2, 0), archive_delay(result, pending=18, failures=2, interval=300))
+
+    def test_nas_transport_failure_retries_with_new_mount_without_touching_snapshot(self):
+        self.add_nas()
+        failed = OSError(errno.EHOSTDOWN, "NAS no longer responds")
+        with patch.object(self.store, "archive_to", side_effect=failed):
+            result = self.worker.cycle(capture_due=False)
+        self.assertIn("retry scheduled", result["archive"])
+        self.assertEqual((15, 1), archive_delay(result, pending=18, failures=0, interval=300))
+        self.assertEqual((120, 9), archive_delay(result, pending=18, failures=8, interval=300))
+        original_stat = Path.stat
+
+        def root_credentials(path, *args, **kwargs):
+            if path == self.config.credentials_file:
+                return SimpleNamespace(st_uid=0, st_mode=0o100600)
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", root_credentials):
+            retried = self.worker.cycle(capture_due=False)
+        self.assertEqual("completed", retried["archive"])
+        self.assertFalse(self.worker.nas_reconnect_needed)
+        self.assertIn(["umount", "--", str(self.config.nas_mount)], self.runner.calls)
+        mount = next(cmd for cmd in self.runner.calls if cmd[:3] == ["mount", "-t", "cifs"])
+        self.assertIn("soft,echo_interval=10", mount[-1])
+        self.assertFalse(any(cmd[0] == "cp" for cmd in self.runner.calls))
+
+    def test_reconnect_never_unmounts_an_unexpected_share(self):
+        self.add_nas("//other/share")
+        self.worker.nas_reconnect_needed = True
+        result = self.worker.cycle(capture_due=False)
+        self.assertIn("configured writable CIFS", result["archive"])
+        self.assertFalse(any(cmd[0] == "umount" for cmd in self.runner.calls))
 
     def test_unsynchronized_clock_still_ingests_but_never_archives_or_prunes(self):
         self.runner.clock = "no"
@@ -340,7 +388,7 @@ class RuntimeTests(unittest.TestCase):
                       {"camera_image": str(self.root / "other.img")},
                       {"nas_source": "//nas.local/dashcam,guest"},
                       {"nas_mount": str(self.root)},
-                      {"retention_days": 0}, {"interval_seconds": 0}):
+                      {"retention_days": -1}, {"interval_seconds": 0}):
             with self.subTest(patch=patch), self.assertRaises(RuntimeSafetyError):
                 Config.from_dict(dict(self.config_dict, **patch))
 

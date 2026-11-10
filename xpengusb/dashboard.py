@@ -71,15 +71,25 @@ def render(status, message=""):
     counts, sync, network, nas = (status[key] for key in ("counts", "sync", "network", "nas"))
     capture = sync.get("capture", "Waiting for a recording snapshot")
     archive = sync.get("archive", "Waiting for the archive worker")
+    phase = {"capturing": "Checking recordings", "uploading": "Checking the NAS queue"}.get(
+        sync.get("phase"), "Between checks")
+    pending_bytes = counts.get("pending_bytes")
+    headroom = status.get("system_headroom")
+    retention = status.get("retention_days", 7)
     result = card("Status", "<dl>" + "".join(
         f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>" for label, value in (
             ("Pi system disk", disk_text(status["os_disk"])),
+            ("System free if archive fills", f"{headroom / 2**30:.1f} GiB" if headroom is not None else "—"),
             ("Pi archive storage", disk_text(status["storage_disk"])),
             ("USB volume, last snapshot", disk_text(sync.get("usb_disk"))),
             ("MP4 recordings in last snapshot", sync.get("recordings", "Waiting for a snapshot")),
             ("Queued files", counts.get("pending", "—")),
+            ("Queued size", f"{pending_bytes / 2**30:.2f} GiB" if pending_bytes is not None else "—"),
             ("Verified NAS files", counts.get("archived", "—")),
+            ("Pi copies after NAS verification", f"Keep for {retention} days" if retention else "Clear after verification"),
+            ("Worker activity", phase),
             ("Last capture", capture), ("Last sync result", archive),
+            ("Local retention check", sync.get("retention", "Waiting for a NAS check")),
             ("Last successful NAS check", when(sync.get("last_success"))),
             ("Last verified upload", when(sync.get("last_upload"))),
             ("Network", (network.get("mode", "Starting") + " " + network.get("ssid", "")).strip()),
@@ -101,7 +111,7 @@ def render(status, message=""):
                    "Save NAS settings", "Test NAS"))
     enabled = status["pushover"]
     result += card("Pushover",
-                   "<p>Receive one message when the upload queue clears, plus persistent backup problems.</p>"
+                   "<p>Get alerts when a backup starts, runs into a problem, retries, or clears the queue.</p>"
                    + form("pushover", '<label>Notifications<select name="enabled">'
                           + f'<option value="0"{" selected" if not enabled else ""}>Off</option>'
                           + f'<option value="1"{" selected" if enabled else ""}>On</option></select></label>'

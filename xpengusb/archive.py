@@ -7,6 +7,8 @@ Production callers must supply expected_source and gate the clock on NTP sync.
 """
 
 import errno
+from contextvars import ContextVar
+from functools import wraps
 import hashlib
 import json
 import math
@@ -24,13 +26,35 @@ import uuid
 RECORDING_DIRS = ("XP_DCIM", "XP_EMER_DCIM")
 CHUNK_SIZE = 1024 * 1024
 DAY = 24 * 60 * 60
+FILE_RETRY_SECONDS = 5 * 60
+MAX_FILE_RETRY_SECONDS = 6 * 60 * 60
+_PROGRESS_CALLBACK = ContextVar("xpengusb_archive_progress", default=None)
 STATUS_QUERY = """SELECT COUNT(*) AS total,
     COALESCE(SUM(verified_at IS NULL),0) AS pending,
+    COALESCE(SUM(CASE WHEN verified_at IS NULL THEN size ELSE 0 END),0) AS pending_bytes,
     COALESCE(SUM(verified_at IS NOT NULL),0) AS archived,
     COALESCE(SUM(purged=0),0) AS retained,
     COALESCE(SUM(purged=1),0) AS pruned,
     COALESCE(SUM(CASE WHEN purged=0 THEN size ELSE 0 END),0) AS retained_bytes
     FROM clips"""
+
+
+def _report_progress():
+    callback = _PROGRESS_CALLBACK.get()
+    if callback is not None:
+        callback()
+
+
+def _with_progress(method):
+    """Scope a store's heartbeat to its operation; helpers keep their API."""
+    @wraps(method)
+    def operation(self, *args, **kwargs):
+        token = _PROGRESS_CALLBACK.set(self.progress)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _PROGRESS_CALLBACK.reset(token)
+    return operation
 
 
 class ArchiveError(RuntimeError):
@@ -51,6 +75,53 @@ class InsufficientSpaceError(ArchiveError):
 
 class ArchiveMountError(ArchiveError):
     pass
+
+
+def is_transport_error(error):
+    """Recognize network/session errors without treating permissions as outages.
+
+    EIO/EREMOTEIO may also indicate a storage fault: this classification permits
+    a controlled reconnect attempt, never a successful-copy receipt or deletion.
+    Unknown errors are still propagated by archive operations.
+    """
+    codes = {getattr(errno, name, None) for name in (
+        "ECONNABORTED", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EHOSTDOWN",
+        "EHOSTUNREACH", "ENETDOWN", "ENETUNREACH", "ENETRESET", "ENOTCONN",
+        "ESTALE", "EPIPE", "EREMOTEIO", "EIO")}
+    codes.discard(None)
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, (TimeoutError, ConnectionError)):
+            return True
+        if isinstance(error, OSError) and error.errno in codes:
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+def _isolated_file_error(error):
+    if is_transport_error(error):
+        return False
+    if isinstance(error, (IntegrityError, UnsafePathError)):
+        return True
+    return isinstance(error, OSError) and error.errno in {
+        errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOTDIR, errno.EISDIR,
+        errno.ELOOP, errno.ENAMETOOLONG,
+    }
+
+
+def _file_error_reason(error):
+    """Persist no paths, filenames, credentials or arbitrary exception text."""
+    if isinstance(error, IntegrityError):
+        return "Recording content could not be verified"
+    if isinstance(error, UnsafePathError):
+        return "Recording path is not a safe regular file or directory"
+    if error.errno in (errno.EACCES, errno.EPERM):
+        return "Recording access was denied"
+    if error.errno == errno.ENOENT:
+        return "Recording file or directory is missing"
+    return "Recording path could not be accessed"
 
 
 def _assert_no_symlinks(path):
@@ -94,7 +165,7 @@ def _regular_open(path):
     return os.fdopen(fd, "rb")
 
 
-def _digest(path):
+def _digest(path, *, with_stat=False):
     digest = hashlib.sha256()
     size = 0
     with _regular_open(path) as stream:
@@ -105,12 +176,14 @@ def _digest(path):
                 break
             digest.update(data)
             size += len(data)
+            _report_progress()
         after = os.fstat(stream.fileno())
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise IntegrityError("Source changed while reading: {}".format(path))
     if size != before.st_size:
         raise IntegrityError("Short read: {}".format(path))
-    return digest.hexdigest(), size
+    result = (digest.hexdigest(), size)
+    return (result, after) if with_stat else result
 
 
 def mp4_has_complete_boxes(path):
@@ -150,6 +223,7 @@ def mp4_has_complete_boxes(path):
             if length > header_length:
                 present.add(kind)
             position += length
+            _report_progress()
         return {b"ftyp", b"moov", b"mdat"}.issubset(present)
 
 
@@ -253,12 +327,15 @@ def _copy_verified(source, destination, expected_digest, expected_size,
                 target.write(data)
                 digest.update(data)
                 count += len(data)
+                _report_progress()
             target.flush()
             os.fsync(target.fileno())
         if count != expected_size or digest.hexdigest() != expected_digest:
             raise IntegrityError("Source changed during copy")
-        if _digest(destination) != (expected_digest, expected_size):
+        contents, verified = _digest(destination, with_stat=True)
+        if contents != (expected_digest, expected_size):
             raise IntegrityError("Copy readback does not match source")
+        return verified
     except BaseException:
         try:
             destination.unlink()
@@ -281,12 +358,33 @@ def _publish_no_replace(temporary, final):
     return True
 
 
+def _matches_published_link(temporary, final, verified):
+    """Check whether the new name still refers to the file we verified.
+
+    The source remains linked until after this check. A successful hard link
+    changes ctime/link count, so compare identity, size and modification time.
+    Some SMB servers return different or unstable file IDs across opens. In
+    that case the caller reads back the final file before granting a receipt.
+    """
+    with _regular_open(temporary) as origin, _regular_open(final) as target:
+        original = os.fstat(origin.fileno())
+        published = os.fstat(target.fileno())
+    return (verified is not None and bool(verified.st_ino)
+            and all(os.path.samestat(verified, item)
+                    and (item.st_size, item.st_mtime_ns) == (verified.st_size, verified.st_mtime_ns)
+                    for item in (original, published)))
+
+
 class ArchiveStore:
     """Persistent content ledger; never modifies the car's snapshot or live disk."""
 
-    def __init__(self, state_dir, spool_dir, retention_days=7):
-        if not isinstance(retention_days, (int, float)) or not math.isfinite(retention_days) or retention_days <= 0:
-            raise ValueError("retention_days must be positive")
+    def __init__(self, state_dir, spool_dir, retention_days=7, progress=None):
+        if (isinstance(retention_days, bool) or not isinstance(retention_days, (int, float))
+                or not math.isfinite(retention_days) or retention_days < 0):
+            raise ValueError("retention_days must be zero or positive")
+        if progress is not None and not callable(progress):
+            raise ValueError("progress must be callable or None")
+        self.progress = progress
         self.retention_seconds = retention_days * DAY
         self.state_dir = _directory(state_dir, create=True, private=True)
         self.spool_dir = _directory(spool_dir, create=True, private=True)
@@ -309,6 +407,10 @@ class ArchiveStore:
                 size INTEGER NOT NULL, spool_key TEXT NOT NULL UNIQUE,
                 verified_at REAL, purged INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(relative, digest));
+            CREATE TABLE IF NOT EXISTS clip_failures (
+                operation TEXT NOT NULL, clip_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL, retry_after REAL NOT NULL, reason TEXT NOT NULL,
+                PRIMARY KEY(operation, clip_id));
         """)
         self.db.commit()
         _fsync_dir(self.state_dir)
@@ -355,6 +457,7 @@ class ArchiveStore:
         intent.unlink(missing_ok=True)
         _fsync_dir(self.intent_dir)
 
+    @_with_progress
     def _recover_intents(self):
         for intent in sorted(self.intent_dir.glob("*.json")):
             try:
@@ -377,6 +480,7 @@ class ArchiveStore:
                                     (relative, digest, size, key))
                     self.db.commit()
                 self._finish_intent(intent)
+                _report_progress()
             except (ValueError, KeyError, TypeError) as error:
                 raise IntegrityError("Invalid ingest recovery receipt") from error
 
@@ -400,8 +504,10 @@ class ArchiveStore:
                     digest, size = _digest(file)
                     valid = file.suffix.lower() != ".mp4" or mp4_has_complete_boxes(file)
                     entries.append((relative, digest, size, valid))
+                    _report_progress()
         return sorted(entries)
 
+    @_with_progress
     def ingest(self, snapshot_root, *, snapshot_id=None, min_free_bytes=0):
         if not isinstance(min_free_bytes, int) or min_free_bytes < 0:
             raise ValueError("min_free_bytes must be a nonnegative integer")
@@ -412,13 +518,20 @@ class ArchiveStore:
         entries = self._scan(root)
         manifest = hashlib.sha256(json.dumps(entries, ensure_ascii=True).encode("utf-8")).hexdigest()
         result = {"observed": len(entries), "ingested": 0, "pending": 0,
-                  "incomplete": sum(not entry[3] for entry in entries), "replayed": False}
+                  "incomplete": sum(not entry[3] for entry in entries), "replayed": False,
+                  "partial": False, "skipped_capacity": 0, "skipped_capacity_bytes": 0}
         self.db.execute("BEGIN IMMEDIATE")
         try:
             seen = self.db.execute("SELECT manifest_sha FROM snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()
             if seen:
                 if seen[0] != manifest:
                     raise IntegrityError("Snapshot ID reused with different content")
+                saved = self.db.execute("SELECT value FROM metadata WHERE key='last_ingest_result'").fetchone()
+                if saved:
+                    saved = json.loads(saved[0])
+                    if saved.get("snapshot_id") == snapshot_id:
+                        for key in ("partial", "skipped_capacity", "skipped_capacity_bytes", "pending"):
+                            result[key] = saved[key]
                 result["replayed"] = True
                 self.db.commit()
                 return result
@@ -432,12 +545,16 @@ class ArchiveStore:
                         stable.append((relative, digest, size))
                 elif valid:
                     result["pending"] += 1
-            required = sum(entry[2] for entry in stable)
-            if shutil.disk_usage(self.spool_dir).free - required < min_free_bytes:
-                raise InsufficientSpaceError("Local spool would breach the recording reserve")
+            # Preserve incident footage first when capacity cannot fit every
+            # new clip. Keep deterministic path ordering within each category.
+            stable.sort(key=lambda entry: (not entry[0].startswith("XP_EMER_DCIM/"), entry[0]))
             for relative, digest, size in stable:
                 key = _spool_key(relative, digest)
                 final = self._spool_path(key)
+                if not final.exists() and shutil.disk_usage(self.spool_dir).free - size < min_free_bytes:
+                    result["skipped_capacity"] += 1
+                    result["skipped_capacity_bytes"] += size
+                    continue
                 _directory(final.parent, create=True, private=True)
                 intent = self._write_intent(relative, digest, size, key)
                 if final.exists():
@@ -451,6 +568,15 @@ class ArchiveStore:
                         _publish_no_replace(temporary, final)
                         if _digest(final) != (digest, size):
                             raise IntegrityError("Local spool publication failed readback")
+                    except InsufficientSpaceError:
+                        # Space can change after the first check while the car
+                        # writes. The copy helper checks the same reserve again
+                        # before creating its temporary file. Smaller later
+                        # clips may still fit; never evict an existing copy.
+                        self._finish_intent(intent)
+                        result["skipped_capacity"] += 1
+                        result["skipped_capacity_bytes"] += size
+                        continue
                     finally:
                         temporary.unlink(missing_ok=True)
                 self.db.execute("INSERT OR IGNORE INTO clips(relative,digest,size,spool_key) VALUES(?,?,?,?)",
@@ -460,11 +586,19 @@ class ArchiveStore:
                 self._finish_intent(intent)
                 result["ingested"] += 1
                 self.db.execute("BEGIN IMMEDIATE")
+            result["partial"] = result["skipped_capacity"] > 0
+            if result["partial"] and result["ingested"] == 0:
+                raise InsufficientSpaceError(
+                    "No new stable clip fits without breaching the recording reserve; "
+                    "{} file(s), {} bytes deferred".format(
+                        result["skipped_capacity"], result["skipped_capacity_bytes"]))
             cursor = self.db.execute("INSERT INTO snapshots(snapshot_id,manifest_sha) VALUES(?,?)", (snapshot_id, manifest))
             generation = cursor.lastrowid
             self.db.execute("DELETE FROM candidates")
             self.db.executemany("INSERT INTO candidates(relative,digest,size,generation) VALUES(?,?,?,?)",
                                 [(r, d, s, generation) for r, d, s, _ in entries])
+            self.db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('last_ingest_result',?)",
+                            (json.dumps(dict(result, snapshot_id=snapshot_id)),))
             self.db.commit()
             return result
         except BaseException:
@@ -485,87 +619,167 @@ class ArchiveStore:
         relative = archive_relative_path(row["relative"], row["digest"])
         return _assert_no_symlinks(nas_root.joinpath(*relative.parts))
 
-    def archive_to(self, nas_root, expected_source=None, now=None, max_files=None):
+    def _record_file_failure(self, operation, row, error, now):
+        self.db.rollback()
+        self.db.execute("BEGIN IMMEDIATE")
+        current = self._clock(now)
+        old = self.db.execute(
+            "SELECT attempts FROM clip_failures WHERE operation=? AND clip_id=?",
+            (operation, row["id"])).fetchone()
+        attempts = old[0] + 1 if old else 1
+        delay = min(MAX_FILE_RETRY_SECONDS, FILE_RETRY_SECONDS * 2 ** min(attempts - 1, 7))
+        reason = _file_error_reason(error)
+        self.db.execute(
+            "INSERT OR REPLACE INTO clip_failures(operation,clip_id,attempts,retry_after,reason) "
+            "VALUES(?,?,?,?,?)", (operation, row["id"], attempts, current + delay, reason))
+        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        return reason
+
+    def _clear_file_failure(self, operation, row):
+        self.db.execute("DELETE FROM clip_failures WHERE operation=? AND clip_id=?",
+                        (operation, row["id"]))
+
+    def _failure_summary(self, operation, current):
+        eligibility = ("clips.verified_at IS NULL" if operation == "archive"
+                       else "clips.verified_at IS NOT NULL AND clips.verified_at<=?")
+        arguments = [operation, current]
+        if operation == "prune":
+            arguments.append(current - self.retention_seconds)
+        row = self.db.execute(
+            "SELECT COUNT(*), MIN(f.retry_after) FROM clip_failures f "
+            "JOIN clips ON clips.id=f.clip_id WHERE f.operation=? AND f.retry_after>? "
+            "AND clips.purged=0 AND " + eligibility, arguments).fetchone()
+        return {"deferred": row[0], "next_retry_at": row[1]}
+
+    @_with_progress
+    def archive_to(self, nas_root, expected_source=None, now=None, max_files=None,
+                   isolate_errors=False):
         if max_files is not None and (type(max_files) is not int or max_files < 1):
             raise ValueError("max_files must be a positive integer or None")
         root = verify_archive_mount(nas_root, expected_source)
         _directory(root, create=True)
         result = {"archived": 0, "already_verified": 0}
+        if isolate_errors:
+            result["failed"] = 0
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self._clock(now)
+            current = self._clock(now)
             result["already_verified"] = self.db.execute(
                 "SELECT COUNT(*) FROM clips WHERE purged=0 AND verified_at IS NOT NULL").fetchone()[0]
             rows = self.db.execute(
-                "SELECT * FROM clips WHERE purged=0 AND verified_at IS NULL ORDER BY id LIMIT ?",
-                (-1 if max_files is None else max_files,)).fetchall()
+                "SELECT clips.* FROM clips LEFT JOIN clip_failures f "
+                "ON f.clip_id=clips.id AND f.operation='archive' "
+                "WHERE purged=0 AND verified_at IS NULL "
+                "AND (?=0 OR f.retry_after IS NULL OR f.retry_after<=?) ORDER BY id LIMIT ?",
+                (int(bool(isolate_errors)), current, -1 if max_files is None else max_files)).fetchall()
             for row in rows:
-                verify_archive_mount(root, expected_source)
-                final = self._archive_path(root, row)
-                _directory(final.parent, create=True)
-                expected = (row["digest"], row["size"])
-                if final.exists():
-                    if _digest(final) != expected:
-                        raise IntegrityError("Existing NAS recording has different content; refusing overwrite")
-                    with _regular_open(final) as stream:
-                        os.fsync(stream.fileno())
-                    _fsync_dir(final.parent)
-                    result["already_verified"] += 1
-                else:
-                    source = self._spool_path(row["spool_key"])
-                    if _digest(source) != expected:
-                        raise IntegrityError("Local recording does not match its ledger")
-                    temporary = final.with_name(".xpengusb-partial-" + uuid.uuid4().hex)
-                    try:
-                        _copy_verified(source, temporary, *expected)
-                        verify_archive_mount(root, expected_source)
-                        _publish_no_replace(temporary, final)
+                try:
+                    verify_archive_mount(root, expected_source)
+                    final = self._archive_path(root, row)
+                    _directory(final.parent, create=True)
+                    expected = (row["digest"], row["size"])
+                    if final.exists():
                         if _digest(final) != expected:
-                            raise IntegrityError("Published NAS recording failed readback")
+                            raise IntegrityError("Existing NAS recording has different content; refusing overwrite")
+                        with _regular_open(final) as stream:
+                            os.fsync(stream.fileno())
                         _fsync_dir(final.parent)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                    result["archived"] += 1
-                verify_archive_mount(root, expected_source)
-                verified_at = self._clock(now)
-                self.db.execute("UPDATE clips SET verified_at=COALESCE(verified_at,?) WHERE id=?",
-                                (verified_at, row["id"]))
-                self.db.commit()
-                self.db.execute("BEGIN IMMEDIATE")
+                        result["already_verified"] += 1
+                    else:
+                        source = self._spool_path(row["spool_key"])
+                        if _digest(source) != expected:
+                            raise IntegrityError("Local recording does not match its ledger")
+                        temporary = final.with_name(".xpengusb-partial-" + uuid.uuid4().hex)
+                        copy_error = None
+                        try:
+                            verified = _copy_verified(source, temporary, *expected)
+                            verify_archive_mount(root, expected_source)
+                            linked = _publish_no_replace(temporary, final)
+                            if (not linked or not _matches_published_link(temporary, final, verified)) \
+                                    and _digest(final) != expected:
+                                raise IntegrityError("Existing NAS recording has different content; refusing overwrite")
+                            _fsync_dir(final.parent)
+                        except BaseException as error:
+                            copy_error = error
+                            raise
+                        finally:
+                            try:
+                                temporary.unlink(missing_ok=True)
+                            except OSError:
+                                # Do not hide the cause needed for transport recovery.
+                                # An incomplete temporary name is never a receipt.
+                                if copy_error is None:
+                                    raise
+                        result["archived"] += 1
+                    verify_archive_mount(root, expected_source)
+                    verified_at = self._clock(now)
+                    self.db.execute("UPDATE clips SET verified_at=COALESCE(verified_at,?) WHERE id=?",
+                                    (verified_at, row["id"]))
+                    self._clear_file_failure("archive", row)
+                    self.db.commit()
+                    self.db.execute("BEGIN IMMEDIATE")
+                except Exception as error:
+                    if not isolate_errors or not _isolated_file_error(error):
+                        raise
+                    result["last_error"] = self._record_file_failure("archive", row, error, now)
+                    result["failed"] += 1
+            if isolate_errors:
+                result.update(self._failure_summary("archive", self._clock(now)))
             self.db.commit()
             return result
         except BaseException:
             self.db.rollback()
             raise
 
-    def prune(self, nas_root, now=None, expected_source=None, max_files=None):
+    @_with_progress
+    def prune(self, nas_root, now=None, expected_source=None, max_files=None,
+              isolate_errors=False):
         if max_files is not None and (type(max_files) is not int or max_files < 1):
             raise ValueError("max_files must be a positive integer or None")
         root = verify_archive_mount(nas_root, expected_source)
         _directory(root)
         result = {"pruned": 0, "kept": 0}
+        if isolate_errors:
+            result["failed"] = 0
         self.db.execute("BEGIN IMMEDIATE")
         try:
             current = self._clock(now)
             retained = self.db.execute("SELECT COUNT(*) FROM clips WHERE purged=0").fetchone()[0]
+            # Zero-day mode should reclaim newly copied recordings before old
+            # receipts whose NAS files may have been moved or removed. Failed
+            # old receipts remain local and use the normal retry backoff.
+            order = "verified_at DESC, id DESC" if self.retention_seconds == 0 else "id"
             rows = self.db.execute(
-                "SELECT * FROM clips WHERE purged=0 AND verified_at IS NOT NULL "
-                "AND verified_at<=? ORDER BY id LIMIT ?",
-                (current - self.retention_seconds, -1 if max_files is None else max_files)).fetchall()
+                "SELECT clips.* FROM clips LEFT JOIN clip_failures f "
+                "ON f.clip_id=clips.id AND f.operation='prune' "
+                "WHERE purged=0 AND verified_at IS NOT NULL AND verified_at<=? "
+                "AND (?=0 OR f.retry_after IS NULL OR f.retry_after<=?) ORDER BY " + order + " LIMIT ?",
+                (current - self.retention_seconds, int(bool(isolate_errors)), current,
+                 -1 if max_files is None else max_files)).fetchall()
             for row in rows:
-                verify_archive_mount(root, expected_source)
-                final = self._archive_path(root, row)
-                if _digest(final) != (row["digest"], row["size"]):
-                    raise IntegrityError("NAS verification failed; local retention is unchanged")
-                verify_archive_mount(root, expected_source)
-                local = self._spool_path(row["spool_key"])
-                local.unlink(missing_ok=True)
-                _fsync_dir(local.parent)
-                self.db.execute("UPDATE clips SET purged=1 WHERE id=?", (row["id"],))
-                self.db.commit()
-                result["pruned"] += 1
-                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    verify_archive_mount(root, expected_source)
+                    final = self._archive_path(root, row)
+                    if _digest(final) != (row["digest"], row["size"]):
+                        raise IntegrityError("NAS verification failed; local retention is unchanged")
+                    verify_archive_mount(root, expected_source)
+                    local = self._spool_path(row["spool_key"])
+                    local.unlink(missing_ok=True)
+                    _fsync_dir(local.parent)
+                    self.db.execute("UPDATE clips SET purged=1 WHERE id=?", (row["id"],))
+                    self._clear_file_failure("prune", row)
+                    self.db.commit()
+                    result["pruned"] += 1
+                    self.db.execute("BEGIN IMMEDIATE")
+                except Exception as error:
+                    if not isolate_errors or not _isolated_file_error(error):
+                        raise
+                    result["last_error"] = self._record_file_failure("prune", row, error, now)
+                    result["failed"] += 1
             result["kept"] = retained - result["pruned"]
+            if isolate_errors:
+                result.update(self._failure_summary("prune", self._clock(now)))
             self.db.commit()
             return result
         except BaseException:
