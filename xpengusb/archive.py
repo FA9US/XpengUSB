@@ -379,8 +379,9 @@ class ArchiveStore:
     """Persistent content ledger; never modifies the car's snapshot or live disk."""
 
     def __init__(self, state_dir, spool_dir, retention_days=7, progress=None):
-        if not isinstance(retention_days, (int, float)) or not math.isfinite(retention_days) or retention_days <= 0:
-            raise ValueError("retention_days must be positive")
+        if (isinstance(retention_days, bool) or not isinstance(retention_days, (int, float))
+                or not math.isfinite(retention_days) or retention_days < 0):
+            raise ValueError("retention_days must be zero or positive")
         if progress is not None and not callable(progress):
             raise ValueError("progress must be callable or None")
         self.progress = progress
@@ -745,11 +746,15 @@ class ArchiveStore:
         try:
             current = self._clock(now)
             retained = self.db.execute("SELECT COUNT(*) FROM clips WHERE purged=0").fetchone()[0]
+            # Zero-day mode should reclaim newly copied recordings before old
+            # receipts whose NAS files may have been moved or removed. Failed
+            # old receipts remain local and use the normal retry backoff.
+            order = "verified_at DESC, id DESC" if self.retention_seconds == 0 else "id"
             rows = self.db.execute(
                 "SELECT clips.* FROM clips LEFT JOIN clip_failures f "
                 "ON f.clip_id=clips.id AND f.operation='prune' "
                 "WHERE purged=0 AND verified_at IS NOT NULL AND verified_at<=? "
-                "AND (?=0 OR f.retry_after IS NULL OR f.retry_after<=?) ORDER BY id LIMIT ?",
+                "AND (?=0 OR f.retry_after IS NULL OR f.retry_after<=?) ORDER BY " + order + " LIMIT ?",
                 (current - self.retention_seconds, int(bool(isolate_errors)), current,
                  -1 if max_files is None else max_files)).fetchall()
             for row in rows:

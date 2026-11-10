@@ -10,10 +10,10 @@ flowchart LR
   Live -->|Btrfs reflink| Snap[Independent snapshot]
   Snap -->|Stable in two snapshots| Spool[Local retained copies]
   Spool -->|SMB copy and SHA-256 readback| NAS[NAS archive]
-  NAS -->|Reverify after seven days| Expire[Eligible local expiry]
+  NAS -->|Reverify after chosen retention| Expire[Eligible local expiry]
 ```
 
-The image lives in a preallocated 96 GiB Btrfs container file on the OS's ext4 filesystem. The installer leaves at least 8 GiB free outside that container. Inside Btrfs, the worker reserves the logical camera-image size plus 8 GiB before adding retained footage. A reflink initially shares blocks; when the car overwrites them, Btrfs needs new space. This reserve is essential.
+The image lives in a 96 GiB Btrfs container file on the OS's ext4 filesystem. The installer allocates the container up front and checks for at least 8 GiB of OS headroom. If the backing file later becomes sparse, some reported OS free space is still needed as the archive fills. The dashboard estimates the remaining system headroom after accounting for that growth. Inside Btrfs, the worker reserves the logical camera-image size plus 8 GiB before adding retained footage. A reflink initially shares blocks. When the car overwrites them, Btrfs needs new space.
 
 This conservative layout means the usable retained-copy budget is **at most roughly 24 GiB when the 32 GiB camera disk is full**, before Btrfs metadata and transient snapshot overhead: `96 - 32 - (32 + 8)`. This is not seven days of unlimited video. Measure your footage size; longer retention at high recording volume needs more capacity and a separate reviewed layout. Changing an installer constant is not a supported resize procedure.
 
@@ -44,6 +44,8 @@ The UUID survives reconfiguration and prevents two installations from mixing arc
 SMB 3.1.1 is requested. The worker checks the actual mounted filesystem and configured `//server/share`; an unmounted directory is never accepted as the NAS. The share must support atomic hard-link publication. A missing feature, permissions failure, full NAS or mismatched content fails closed. There is no automatic downgrade to SMB 1, no filename-based overwrite and no completed NAS-file deletion.
 
 After the destination is flushed and read back with matching SHA-256, a first-success timestamp is recorded. Copy retries do not restart an already recorded retention period. NAS contents are verified again before local expiry. NTP synchronization is required for upload receipts and expiry because the Pi Zero W lacks a battery-backed clock. A clock rollback pauses time-based operations.
+
+`retention_days` defaults to 7 and accepts integer values from 0 through 365. With 0, a verified receipt is immediately eligible for local cleanup, including receipts recorded before switching modes. The worker still performs a second full NAS readback before deleting the local spool file. This costs another file-sized read over Wi-Fi. Cleanup stays bounded to two eligible files per batch; zero-day mode checks newest receipts first so newly completed backups can release space before older receipts with missing NAS files. Missing or corrupt NAS copies leave their local files intact and are retried with backoff. The camera image and completed NAS files are never deleted by cleanup.
 
 ## Limits and recovery
 

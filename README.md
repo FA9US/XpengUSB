@@ -12,7 +12,7 @@ Record in the car. Come home to Wi-Fi. Keep verified copies on your NAS. includi
 - Copies stable files from both folders, including subfolders, without assuming a particular filename or camera naming scheme.
 - Uses independent snapshots while the car continues recording. It never mounts or edits the live camera filesystem on the Pi.
 - Copies footage over home Wi-Fi to an **SMB 3 NAS share**, and reads it back to verify its SHA-256 checksum.
-- Keeps a separate local copy for **at least seven days after successful NAS verification**. Local expiry also requires the NAS copy to verify again.
+- Keeps a separate local copy for **seven days after successful NAS verification by default**. Choose **0 days** to clear verified local copies sooner. Cleanup always verifies the NAS copy again before deleting local data.
 - Never automatically expires recordings on the NAS. Different footage with a reused filename gets a different archive name.
 
 There is no vehicle login, wake command, subscription, cloud upload, web server or default password. Browse ordinary MP4 files directly on your NAS. XGuard footage held only in the car's internal storage cannot be retrieved through this USB connection.
@@ -61,7 +61,7 @@ sudo bash install.sh --prepare-storage
 sudo reboot
 ```
 
-The installer creates its own 96 GiB storage container and 32 GiB camera image; it does not repartition the card. It refuses to reformat existing storage. Its wizard asks for the NAS server, share, username and password. Enter the password only at its hidden prompt. Keep credentials out of GitHub and issues. To change those details later, safely eject the USB host, stop both services (`sudo systemctl stop xpengusb xpengusb-gadget`), run `sudo python3 /usr/local/lib/xpengusb/configure.py`, then reboot.
+The installer creates its own 96 GiB storage container and 32 GiB camera image; it does not repartition the card. It refuses to reformat existing storage. Its wizard asks for the NAS server, share, local retention days, username and password. Keep **7 days** for a local backup after copying, or enter **0** to clear local copies after NAS verification. Enter the password only at its hidden prompt. Keep credentials out of GitHub and issues. To change those details later, safely eject the USB host, stop both services (`sudo systemctl stop xpengusb xpengusb-gadget`), run `sudo python3 /usr/local/lib/xpengusb/configure.py`, then reboot.
 
 For a Windows share written as `\\nas.local\dashcam`, enter **server** `nas.local` and **share** `dashcam`, separately. SMB and CIFS refer to the same client path here; SMB 3 is required, with no SMB 1 fallback. The share must already exist. XpengUSB does not configure the NAS.
 
@@ -82,11 +82,13 @@ Connect the Pi's **USB** port to the car's Driving Recorder data port. Confirm d
 
 Complete the [staged car tests](docs/TESTING.md), including recording during upload, overnight power, and a failed Wi-Fi/NAS connection. A powered port does not prove the recorder is working. Use the car's **Safe Eject** before disconnecting.
 
-## Understand the seven-day limit
+## Understand local retention
 
-Seven days refers to the Pi's **separate retained copies**, measured from first successful NAS verification, not the car's playback list. The car can loop-delete its own files sooner. Files not verified on the NAS do not qualify for local expiry.
+The default seven days refers to the Pi's **separate retained copies**, measured from first successful NAS verification, not the car's playback list. The car can loop-delete its own files sooner. Files not verified on the NAS do not qualify for local expiry.
 
-A 128 GB card has finite capacity. The layout reserves space for the OS and a complete camera-volume rewrite; the retained-copy budget is smaller than the card. When that budget is exhausted, XpengUSB pauses capture into the retained-copy store and logs the problem. It does not silently delete unarchived or younger-than-seven-day retained files. The car can still overwrite recordings that were never captured. Measure daily recording volume during testing; seven days of heavy or continuous use may require different storage/hardware.
+With **0 days**, local copies become eligible immediately after a verified NAS backup. Cleanup processes small batches, newest verified copies first, and reads each NAS file back again before removing its local copy. This also applies to older local copies when you change to 0 days. A missing or changed NAS file keeps its local copy. The extra verification takes time over Wi-Fi, so space is reclaimed as checks complete. Neither mode deletes files from the car's recording disk or the NAS.
+
+A 128 GB card has finite capacity. The layout reserves space for the OS and a complete camera-volume rewrite; the retained-copy budget is smaller than the card. When that budget is exhausted, XpengUSB pauses capture into the retained-copy store and logs the problem. It does not silently delete unarchived files or copies still inside the chosen retention period. The car can still overwrite recordings that were never captured. Measure daily recording volume during testing; seven days of heavy or continuous use may require different storage/hardware.
 
 “Indefinite NAS retention” means **XpengUSB does not delete finished NAS recordings**. NAS quotas, capacity, snapshots, independent backups and administrator actions still matter.
 

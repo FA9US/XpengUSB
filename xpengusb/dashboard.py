@@ -74,15 +74,19 @@ def render(status, message=""):
     phase = {"capturing": "Checking recordings", "uploading": "Checking the NAS queue"}.get(
         sync.get("phase"), "Between checks")
     pending_bytes = counts.get("pending_bytes")
+    headroom = status.get("system_headroom")
+    retention = status.get("retention_days", 7)
     result = card("Status", "<dl>" + "".join(
         f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>" for label, value in (
             ("Pi system disk", disk_text(status["os_disk"])),
+            ("System free if archive fills", f"{headroom / 2**30:.1f} GiB" if headroom is not None else "—"),
             ("Pi archive storage", disk_text(status["storage_disk"])),
             ("USB volume, last snapshot", disk_text(sync.get("usb_disk"))),
             ("MP4 recordings in last snapshot", sync.get("recordings", "Waiting for a snapshot")),
             ("Queued files", counts.get("pending", "—")),
             ("Queued size", f"{pending_bytes / 2**30:.2f} GiB" if pending_bytes is not None else "—"),
             ("Verified NAS files", counts.get("archived", "—")),
+            ("Pi copies after NAS verification", f"Keep for {retention} days" if retention else "Clear after verification"),
             ("Worker activity", phase),
             ("Last capture", capture), ("Last sync result", archive),
             ("Local retention check", sync.get("retention", "Waiting for a NAS check")),

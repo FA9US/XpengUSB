@@ -59,6 +59,19 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(updated["archive_device_id"], existing["archive_device_id"])
         self.assertEqual(updated["nas_source"], existing["nas_source"])
 
+    def test_zero_retention_is_preserved_on_reconfiguration(self):
+        existing = configure.default_config()
+        existing["retention_days"] = 0
+        self.assertEqual(configure.default_config(existing)["retention_days"], 0)
+
+    def test_retention_prompt_accepts_zero_and_rejects_invalid_values(self):
+        for value in (0, "0", " 0 ", 7, "365"):
+            with self.subTest(value=value):
+                self.assertEqual(configure.parse_retention_days(value), int(value))
+        for value in (-1, "-1", 366, "366", True, False, None, 0.0, "0.5", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                configure.parse_retention_days(value)
+
     def test_reconfiguration_rejects_storage_redirection(self):
         for key in configure.FIXED_PATHS:
             existing = configure.default_config()

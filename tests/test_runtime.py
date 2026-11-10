@@ -238,6 +238,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((work / "cam.img").exists())
         self.assertFalse(any(cmd[0] == "cp" for cmd in self.runner.calls))
 
+    def test_zero_day_retention_is_valid_configuration(self):
+        config = Config.from_dict(dict(self.config_dict, retention_days=0))
+        self.assertEqual(config.retention_days, 0)
+
     def test_low_space_does_not_block_nas_copy_and_retention(self):
         self.add_nas()
         self.worker.free_bytes = lambda path: 39 * GIB
@@ -384,7 +388,7 @@ class RuntimeTests(unittest.TestCase):
                       {"camera_image": str(self.root / "other.img")},
                       {"nas_source": "//nas.local/dashcam,guest"},
                       {"nas_mount": str(self.root)},
-                      {"retention_days": 0}, {"interval_seconds": 0}):
+                      {"retention_days": -1}, {"interval_seconds": 0}):
             with self.subTest(patch=patch), self.assertRaises(RuntimeSafetyError):
                 Config.from_dict(dict(self.config_dict, **patch))
 

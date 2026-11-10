@@ -119,8 +119,8 @@ class Config:
             uuid.UUID(self.archive_device_id)
         except (ValueError, TypeError, AttributeError) as exc:
             raise RuntimeSafetyError("archive_device_id must be a UUID") from exc
-        if type(self.retention_days) is not int or not 1 <= self.retention_days <= 365:
-            raise RuntimeSafetyError("retention_days must be 1 through 365")
+        if type(self.retention_days) is not int or not 0 <= self.retention_days <= 365:
+            raise RuntimeSafetyError("retention_days must be 0 through 365; 0 clears verified local copies")
         if type(self.interval_seconds) is not int or self.interval_seconds < 30:
             raise RuntimeSafetyError("interval_seconds must be at least 30")
 
