@@ -2,17 +2,19 @@
 
 import json
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
 
 from xpengusb.runtime import (Config, GIB, Mount, RuntimeSafetyError, Worker,
-                              main, parse_mountinfo)
+                              archive_delay, main, parse_mountinfo)
 
 # Scale storage units in controller tests: these are fixture files, not disk
 # performance or real sparse-file tests. Windows truncate can allocate zeros.
@@ -273,6 +275,48 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(expected_remaining, backlog["expired"])
         self.assertEqual(["ingest", "archive", "prune"] * 2,
                          [call[0] for call in self.store.calls])
+
+    def test_upload_only_cycle_reports_attempt_without_rescanning_camera(self):
+        self.add_nas()
+        progress = []
+        result = self.worker.cycle(capture_due=False, report=progress.append)
+        self.assertEqual(["archive", "prune"], [call[0] for call in self.store.calls])
+        self.assertNotIn("capture", result)
+        self.assertEqual("uploading", progress[0]["phase"])
+        self.assertEqual(progress[0]["archive_attempt"], result["archive_attempt"])
+        self.assertEqual("idle", result["phase"])
+        self.assertEqual((2, 0), archive_delay(result, pending=18, failures=2, interval=300))
+
+    def test_nas_transport_failure_retries_with_new_mount_without_touching_snapshot(self):
+        self.add_nas()
+        failed = OSError(errno.EHOSTDOWN, "NAS no longer responds")
+        with patch.object(self.store, "archive_to", side_effect=failed):
+            result = self.worker.cycle(capture_due=False)
+        self.assertIn("retry scheduled", result["archive"])
+        self.assertEqual((15, 1), archive_delay(result, pending=18, failures=0, interval=300))
+        self.assertEqual((120, 9), archive_delay(result, pending=18, failures=8, interval=300))
+        original_stat = os.stat
+
+        def root_credentials(path, *args, **kwargs):
+            if path == self.config.credentials_file:
+                return SimpleNamespace(st_uid=0, st_mode=0o100600)
+            return original_stat(path, *args, **kwargs)
+
+        with patch("xpengusb.runtime.os.stat", side_effect=root_credentials):
+            retried = self.worker.cycle(capture_due=False)
+        self.assertEqual("completed", retried["archive"])
+        self.assertFalse(self.worker.nas_reconnect_needed)
+        self.assertIn(["umount", "--", str(self.config.nas_mount)], self.runner.calls)
+        mount = next(cmd for cmd in self.runner.calls if cmd[:3] == ["mount", "-t", "cifs"])
+        self.assertIn("soft,echo_interval=10", mount[-1])
+        self.assertFalse(any(cmd[0] == "cp" for cmd in self.runner.calls))
+
+    def test_reconnect_never_unmounts_an_unexpected_share(self):
+        self.add_nas("//other/share")
+        self.worker.nas_reconnect_needed = True
+        result = self.worker.cycle(capture_due=False)
+        self.assertIn("configured writable CIFS", result["archive"])
+        self.assertFalse(any(cmd[0] == "umount" for cmd in self.runner.calls))
 
     def test_unsynchronized_clock_still_ingests_but_never_archives_or_prunes(self):
         self.runner.clock = "no"

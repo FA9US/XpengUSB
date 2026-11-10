@@ -206,6 +206,39 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(result["already_verified"], 2)
         self.assertEqual(self.store.status()["pending"], 0)
 
+    def test_bad_clip_is_retried_without_blocking_other_uploads(self):
+        self.write("XP_DCIM/a.mp4")
+        self.write("XP_DCIM/b.mp4")
+        self.capture_twice()
+        bad, good = self.rows()
+        final = self.final(bad)
+        final.parent.mkdir(parents=True)
+        final.write_bytes(b"different NAS content")
+        first = self.store.archive_to(self.nas, now=100, max_files=2, isolate_errors=True)
+        self.assertEqual((1, 1), (first["archived"], first["failed"]))
+        self.assertTrue(self.final(good).is_file())
+        self.assertEqual(b"different NAS content", final.read_bytes())
+        second = self.store.archive_to(self.nas, now=101, max_files=2, isolate_errors=True)
+        self.assertEqual(1, second["deferred"])
+        final.unlink()
+        third = self.store.archive_to(self.nas, now=first["next_retry_at"], max_files=2,
+                                      isolate_errors=True)
+        self.assertEqual(1, third["archived"])
+        self.assertEqual(0, self.store.status()["pending"])
+
+    def test_missing_nas_copy_does_not_block_other_expired_files(self):
+        self.write("XP_DCIM/a.mp4")
+        self.write("XP_DCIM/b.mp4")
+        self.capture_twice()
+        self.store.archive_to(self.nas, now=100)
+        missing, kept_on_nas = self.rows()
+        self.final(missing).unlink()
+        result = self.store.prune(self.nas, now=100 + 7 * archive.DAY, max_files=2,
+                                  isolate_errors=True)
+        self.assertEqual((1, 1), (result["pruned"], result["failed"]))
+        self.assertTrue(self.store._spool_path(missing["spool_key"]).is_file())
+        self.assertTrue(self.final(kept_on_nas).is_file())
+
     def test_prune_batch_bounds_eligible_readbacks_and_retains_the_rest(self):
         for name in ("a", "b", "c", "d"):
             self.write("XP_DCIM/" + name + ".mp4")

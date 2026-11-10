@@ -260,19 +260,30 @@ def record_cycle(config, store, result):
     if status.get("destination") != destination:
         status = {}
     now = time.time()
-    counts = ArchiveStore.read_status(config.state_dir)
-    status.update(cycle=time.time_ns(), destination=destination,
-                  capture=result["capture"], archive=result["archive"],
-                  archived=counts["archived"], pending=counts["pending"])
+    counts = store.status()
+    previous_archived = status.get("archived", counts["archived"])
+    status.update(destination=destination, archived=counts["archived"],
+                  pending=counts["pending"], pending_bytes=counts.get("pending_bytes", 0))
+    for key in ("phase", "capture", "capture_checked", "archive", "archive_attempt", "retention"):
+        if key in result:
+            status[key] = result[key]
+    archive = result.get("archive")
+    if archive and archive not in {"completed", "waiting for synchronized clock"}:
+        status["archive_failure"] = result.get("archive_attempt", time.time_ns())
+        status["archive_failure_reason"] = archive
+    if result.get("phase", "idle") == "idle":
+        status["cycle"] = time.time_ns()
+    if "capture_checked" in result:
+        status["skipped_capacity"] = result.get("skipped_capacity", 0)
     if "usb_disk" in result:
         status["usb_disk"] = result["usb_disk"]
         status["recordings"] = store.db.execute(
             "SELECT COUNT(*) FROM candidates WHERE lower(relative) GLOB '*.mp4'"
         ).fetchone()[0]
-    if result["archive"] == "completed":
+    if result.get("archive") == "completed":
         status["last_success"] = now
-    if result.get("uploaded"):
-        status["last_upload"] = now
+    if counts["archived"] > previous_archived:
+        status["last_upload"] = store.db.execute("SELECT MAX(verified_at) FROM clips").fetchone()[0]
     write_json(SYNC_STATUS, status)
 
 
@@ -335,7 +346,8 @@ def ha_status():
             "storage_disk": disk_usage(config.storage_dir)
             if any(m.target == config.storage_dir and m.fstype == "btrfs" for m in read_mounts()) else {},
             "usb_disk": sync.get("usb_disk", {}),
-            **{key: sync.get(key) for key in ("recordings", "pending", "archived", "last_success", "last_upload")},
+            **{key: sync.get(key) for key in ("recordings", "pending", "pending_bytes", "archived",
+                                             "last_success", "last_upload", "capture", "phase")},
             "sync": sync.get("archive", "Waiting for a cycle"), "network": network.get("mode", "Starting"),
             "connected_ssid": network.get("ssid", ""), "home_ssid": wifi["home_ssid"],
             "hotspot_ssid": wifi["ap_ssid"], "nas_destination": config.nas_source +

@@ -2,9 +2,8 @@
 
 The car owns the live FAT volume. This module never mounts, repairs, or
 disconnects that volume. Only a private Btrfs reflink is repaired and mounted.
-Each cycle captures first, then transfers at most two files and checks at most
-two expired files. One large file or blocked SMB I/O can still delay capture;
-these batch limits are not a hard real-time deadline.
+Capture and NAS work are scheduled independently. NAS work yields after each
+bounded batch so an upload backlog does not repeatedly rescan the camera disk.
 """
 
 from __future__ import annotations
@@ -17,12 +16,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable
+
+from .archive import is_transport_error
 
 
 LOG = logging.getLogger("xpengusb")
@@ -31,10 +33,31 @@ MIN_TRUSTED_TIME = 1735689600  # 2025-01-01; the Pi has no battery-backed clock.
 SNAPSHOT_NAME = re.compile(r"^[0-9a-f]{32}$")
 LOOP_NAME = re.compile(r"^/dev/loop[0-9]+$")
 ARCHIVE_BATCH_FILES = 2
+ARCHIVE_CONTINUE_SECONDS = 2
+ARCHIVE_RETRY_SECONDS = 15
+ARCHIVE_RETRY_MAX_SECONDS = 120
 
 
 class RuntimeSafetyError(RuntimeError):
     """A prerequisite failed; keep the recorder connected and retry later."""
+
+
+class Watchdog:
+    """Feed systemd from work that is advancing, never from a background thread."""
+
+    def __init__(self):
+        address = os.environ.get("NOTIFY_SOCKET", "")
+        usec = os.environ.get("WATCHDOG_USEC", "0")
+        self.address = ("\0" + address[1:]) if address.startswith("@") else address
+        self.interval = int(usec) / 3_000_000 if address and usec.isdecimal() else 0
+        self.next_ping = 0.0
+
+    def ping(self):
+        if not self.interval or time.monotonic() < self.next_ping:
+            return
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.sendto(b"WATCHDOG=1", self.address)
+        self.next_ping = time.monotonic() + self.interval
 
 
 @dataclass(frozen=True)
@@ -166,16 +189,21 @@ class Runner:
 class Worker:
     def __init__(self, config: Config, store, *, runner=None,
                  mounts: Callable = read_mounts, free_bytes: Callable = available_bytes,
-                 now: Callable = time.time):
+                 now: Callable = time.time, progress=None):
         self.config = config
         self.store = store
         self.runner = runner or Runner()
         self.mounts = mounts
         self.free_bytes = free_bytes
         self.now = now
+        self.progress = progress
+        self.nas_reconnect_needed = False
 
     def _run(self, *args, **kwargs):
-        return self.runner.run([str(arg) for arg in args], **kwargs)
+        result = self.runner.run([str(arg) for arg in args], **kwargs)
+        if self.progress:
+            self.progress()
+        return result
 
     def _mount_at(self, target: Path):
         found = [entry for entry in self.mounts() if entry.target == target]
@@ -202,12 +230,18 @@ class Worker:
 
     def ensure_nas(self) -> None:
         path = self.config.nas_mount
+        if self._mount_at(path):
+            self._verify_nas()
+            if not self.nas_reconnect_needed:
+                return
+            # Archive calls have returned and closed their handles. Never force
+            # or lazily detach a busy mount, and never detach an unrelated share.
+            self._run("umount", "--", path, timeout=30)
+            if self._mount_at(path):
+                raise RuntimeSafetyError("Previous NAS session is still mounted")
         _no_symlinks(path)
         if not path.is_dir():
             raise RuntimeSafetyError("NAS mount directory is missing")
-        if self._mount_at(path):
-            self._verify_nas()
-            return
         if any(path.iterdir()):
             raise RuntimeSafetyError("Refusing to hide files below the NAS mount point")
         credentials = self.config.credentials_file
@@ -218,10 +252,11 @@ class Worker:
             raise RuntimeSafetyError("SMB credentials must be a root-owned private regular file")
         options = ("credentials=" + str(credentials)
                    + ",vers=3.1.1,sec=ntlmssp,nodev,nosuid,noexec,cache=none,actimeo=0,"
-                     "uid=0,gid=0,file_mode=0600,dir_mode=0700")
+                     "soft,echo_interval=10,nosharesock,uid=0,gid=0,file_mode=0600,dir_mode=0700")
         self._run("mount", "-t", "cifs", self.config.nas_source, path, "-o", options,
                   timeout=45)
         self._verify_nas()
+        self.nas_reconnect_needed = False
 
     def archive(self, now: float) -> dict:
         self._verify_nas()
@@ -229,16 +264,20 @@ class Worker:
         # cycle-start timestamp: copying over Wi-Fi can take hours.
         result = self.store.archive_to(self.config.archive_root,
                                        expected_source=self.config.nas_source,
-                                       max_files=ARCHIVE_BATCH_FILES)
+                                       max_files=ARCHIVE_BATCH_FILES, isolate_errors=True)
         LOG.info("Archive: %s", result)
         now = self.trusted_time()
         if now is None:
             LOG.warning("Retention deferred: clock no longer synchronized")
+            result["retention"] = "Waiting for synchronized clock"
         else:
             retention = self.store.prune(self.config.archive_root,
                                          expected_source=self.config.nas_source, now=now,
-                                         max_files=ARCHIVE_BATCH_FILES)
+                                         max_files=ARCHIVE_BATCH_FILES, isolate_errors=True)
             LOG.info("Retention: %s", retention)
+            result["pruned"] = retention["pruned"]
+            if retention.get("failed") or retention.get("deferred"):
+                result["retention"] = "Some expired files need NAS re-verification"
         return result
 
     def _check_storage(self) -> int:
@@ -408,11 +447,14 @@ class Worker:
                 self._check_snapshot_mount(work, loop)
             result = self.store.ingest(target, snapshot_id=work.name, min_free_bytes=reserve)
             LOG.info("Snapshot ingestion: %s", result)
+            capture = {key: result[key] for key in
+                       ("partial", "skipped_capacity", "skipped_capacity_bytes") if key in result}
             try:
                 usage = shutil.disk_usage(target)
             except OSError:
-                return {}
-            return {"usb_disk": {"total": usage.total, "free": usage.free}}
+                return capture
+            capture["usb_disk"] = {"total": usage.total, "free": usage.free}
+            return capture
         except Exception:
             LOG.warning("Snapshot ingestion failed; committed spool is retained. "
                         "This snapshot will be released after a safe unmount; "
@@ -423,39 +465,69 @@ class Worker:
             # recoverable ingestion error. Failed unmount/detach preserves it.
             self._release(work, loop)
 
-    def cycle(self) -> dict:
+    def cycle(self, *, capture_due=True, archive_due=True, report=None, nas_active=None) -> dict:
         outcomes = {}
-        now = None
         try:
             self._check_storage()
         except Exception as exc:
             LOG.warning("Storage unavailable: %s", exc)
-            return {"archive": "storage unavailable", "capture": str(exc)}
+            return {"archive": "storage unavailable", "capture": str(exc),
+                    "capture_checked": time.time_ns(), "phase": "idle"}
         # Capture before network work so an existing NAS backlog cannot defer
         # the first snapshot indefinitely. A failed capture (including low
         # space) must still permit uploading and pruning retained footage.
-        try:
-            capture = self.capture()
-            if capture:
-                outcomes.update(capture)
-            outcomes["capture"] = "completed"
-        except Exception as exc:
-            outcomes["capture"] = str(exc)
-            LOG.warning("Capture deferred: %s", exc)
-        try:
-            now = self.trusted_time()
-            if now is None:
-                outcomes["archive"] = "waiting for synchronized clock"
-            else:
-                self.ensure_nas()
-                upload = self.archive(now)
-                if upload:
+        if capture_due:
+            if report:
+                report({"phase": "capturing"})
+            try:
+                outcomes.update(self.capture())
+                outcomes["capture"] = ("Low storage: some clips could not be imported"
+                                       if outcomes.get("partial") else "completed")
+            except Exception as exc:
+                outcomes["capture"] = str(exc)
+                LOG.warning("Capture deferred: %s", exc)
+            outcomes["capture_checked"] = time.time_ns()
+        if archive_due:
+            try:
+                now = self.trusted_time()
+                if now is None:
+                    outcomes["archive"] = "waiting for synchronized clock"
+                else:
+                    outcomes["archive_attempt"] = time.time_ns()
+                    if report:
+                        report({**outcomes, "phase": "uploading"})
+                    if nas_active:
+                        nas_active.touch()
+                    self.ensure_nas()
+                    upload = self.archive(now)
                     outcomes["uploaded"] = upload["archived"]
-                outcomes["archive"] = "completed"
-        except Exception as exc:
-            outcomes["archive"] = str(exc)
-            LOG.warning("Archive deferred: %s", exc)
+                    outcomes["pruned"] = upload.get("pruned", 0)
+                    outcomes["archive"] = "completed"
+                    if upload.get("failed") or upload.get("deferred"):
+                        outcomes["archive"] = upload.get("last_error") or "Some queued files need retry"
+                    outcomes["retention"] = upload.get("retention", "completed")
+            except Exception as exc:
+                if is_transport_error(exc):
+                    self.nas_reconnect_needed = True
+                    outcomes["archive"] = "NAS connection interrupted; retry scheduled"
+                else:
+                    outcomes["archive"] = str(exc)
+                LOG.warning("Archive deferred: %s", exc)
+            if nas_active:
+                nas_active.unlink(missing_ok=True)
+        outcomes["phase"] = "idle"
         return outcomes
+
+
+def archive_delay(result, pending, failures, interval):
+    if (result.get("uploaded", 0) and pending) or result.get("pruned", 0) == ARCHIVE_BATCH_FILES:
+        return ARCHIVE_CONTINUE_SECONDS, 0
+    if result["archive"] == "waiting for synchronized clock":
+        return min(30, interval), 0
+    if result["archive"] != "completed":
+        delay = min(ARCHIVE_RETRY_MAX_SECONDS, ARCHIVE_RETRY_SECONDS * 2 ** min(failures, 3))
+        return min(delay, interval), failures + 1
+    return interval, 0
 
 
 @contextlib.contextmanager
@@ -500,31 +572,59 @@ def main(argv=None) -> int:
             # Do this before constructing the database, including for --status.
             # An unmounted storage volume must never create state on the OS disk.
             Worker(config, None)._check_storage()
+            watchdog = Watchdog()
+            watchdog.ping()
             with ArchiveStore(config.state_dir, config.spool_dir,
-                              retention_days=config.retention_days) as store:
-                worker = Worker(config, store)
-                while True:
-                    sync_request = lock_dir / "sync-request"
-                    sync_request.unlink(missing_ok=True)
-                    result = worker.cycle()
-                    if Path("/etc/xpengusb/wifi.json").exists():
+                              retention_days=config.retention_days, progress=watchdog.ping) as store:
+                worker = Worker(config, store, progress=watchdog.ping)
+                dashboard = Path("/etc/xpengusb/wifi.json").exists()
+                sync_request = lock_dir / "sync-request"
+                nas_active = lock_dir / "nas-active"
+
+                def report(result):
+                    if dashboard:
                         try:
                             from .dashboard_control import record_cycle
                             record_cycle(config, store, result)
                         except Exception:
                             LOG.warning("Could not refresh dashboard status")
+
+                next_capture = next_archive = 0.0
+                failures = 0
+                if nas_active.exists():
+                    worker.nas_reconnect_needed = True
+                    report({"phase": "idle", "archive_attempt": time.time_ns(),
+                            "archive": "NAS transfer was interrupted; retry scheduled"})
+                while True:
+                    watchdog.ping()
+                    requested = dashboard and sync_request.exists()
+                    if requested:
+                        sync_request.unlink(missing_ok=True)
+                    started = time.monotonic()
+                    capture_due = requested or started >= next_capture
+                    archive_due = requested or started >= next_archive
+                    result = worker.cycle(capture_due=capture_due, archive_due=archive_due,
+                                          report=report if dashboard else None, nas_active=nas_active)
+                    report(result)
                     if args.once:
                         print(json.dumps(result, indent=2))
                         return 0 if result.get("capture") == "completed" else 1
-                    if not Path("/etc/xpengusb/wifi.json").exists():
-                        time.sleep(config.interval_seconds)
-                    else:
-                        next_cycle = time.monotonic() + config.interval_seconds
-                        while not sync_request.exists():
-                            remaining = next_cycle - time.monotonic()
-                            if remaining <= 0:
-                                break
-                            time.sleep(min(remaining, 2))
+                    finished = time.monotonic()
+                    if capture_due:
+                        next_capture = finished + config.interval_seconds
+                    if "archive" in result:
+                        delay, failures = archive_delay(result, store.status()["pending"], failures,
+                                                        config.interval_seconds)
+                        next_archive = finished + delay
+                    elif capture_due and failures == 0 and store.status()["pending"]:
+                        next_archive = finished
+                    while not (dashboard and sync_request.exists()):
+                        watchdog.ping()
+                        remaining = min(next_capture, next_archive) - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        limit = 2 if dashboard else watchdog.interval or remaining
+                        time.sleep(min(remaining, limit))
     except Exception as exc:
         LOG.error("Worker stopped: %s", exc)
         return 1

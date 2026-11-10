@@ -51,6 +51,8 @@ The handbook's 10 MB/s minimum is a benchmark target, not a claim this Zero W me
 | Recorder unavailable or slow | Return to working USB drive, then bench-test card/cable/write speed and capture load |
 | No NAS copies | Two snapshots completed, NTP synchronized, correct server/share/account, SMB 3.1.1 support, NAS quota and hard-link support |
 | Copy verification or existing-file mismatch | Preserve both copies; inspect NAS/disk errors; do not delete the local ledger to silence the error |
+
+For an update from an older dashboard, wait for the current NAS operation to finish before running `install-dashboard.sh`. The worker unit and Python modules must be updated together to enable the watchdog. Back up both before updating. To roll back, stop only `xpengusb.service`, restore the prior Python modules and `xpengusb.service`, run `systemctl daemon-reload`, then start `xpengusb.service` again. Keep the live USB image, archive database, spool and credential files.
 | Capture low-space messages | Seven-day or unarchived copies consume the budget; upload/reverify eligible files or redesign capacity, not forced eviction |
 | Snapshot unmount errors | Stop worker after safe eject, inspect mount/loop users; never delete a mounted image or use lazy unmount |
 | Installer says incomplete storage | It deliberately refuses automatic formatting. Save logs and existing storage; reflash only after backing up needed data |
