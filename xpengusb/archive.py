@@ -165,7 +165,7 @@ def _regular_open(path):
     return os.fdopen(fd, "rb")
 
 
-def _digest(path):
+def _digest(path, *, with_stat=False):
     digest = hashlib.sha256()
     size = 0
     with _regular_open(path) as stream:
@@ -182,7 +182,8 @@ def _digest(path):
         raise IntegrityError("Source changed while reading: {}".format(path))
     if size != before.st_size:
         raise IntegrityError("Short read: {}".format(path))
-    return digest.hexdigest(), size
+    result = (digest.hexdigest(), size)
+    return (result, after) if with_stat else result
 
 
 def mp4_has_complete_boxes(path):
@@ -331,14 +332,10 @@ def _copy_verified(source, destination, expected_digest, expected_size,
             os.fsync(target.fileno())
         if count != expected_size or digest.hexdigest() != expected_digest:
             raise IntegrityError("Source changed during copy")
-        verified = os.stat(destination, follow_symlinks=False)
-        if _digest(destination) != (expected_digest, expected_size):
+        contents, verified = _digest(destination, with_stat=True)
+        if contents != (expected_digest, expected_size):
             raise IntegrityError("Copy readback does not match source")
-        after = os.stat(destination, follow_symlinks=False)
-        if (not os.path.samestat(verified, after)
-                or (verified.st_size, verified.st_mtime_ns) != (after.st_size, after.st_mtime_ns)):
-            raise IntegrityError("Copy changed during verification")
-        return after
+        return verified
     except BaseException:
         try:
             destination.unlink()
@@ -361,22 +358,21 @@ def _publish_no_replace(temporary, final):
     return True
 
 
-def _verify_published_link(temporary, final, verified):
-    """Prove a new name still refers to the file whose bytes were verified.
+def _matches_published_link(temporary, final, verified):
+    """Check whether the new name still refers to the file we verified.
 
     The source remains linked until after this check. A successful hard link
     changes ctime/link count, so compare identity, size and modification time.
-    Missing or unreliable identity fails closed rather than trusting a name.
+    Some SMB servers return different or unstable file IDs across opens. In
+    that case the caller reads back the final file before granting a receipt.
     """
     with _regular_open(temporary) as origin, _regular_open(final) as target:
         original = os.fstat(origin.fileno())
         published = os.fstat(target.fileno())
-    if (verified is None or not verified.st_ino
-            or not os.path.samestat(verified, original)
-            or not os.path.samestat(verified, published)
-            or any((item.st_size, item.st_mtime_ns) != (verified.st_size, verified.st_mtime_ns)
-                   for item in (original, published))):
-        raise IntegrityError("Published NAS recording is not the verified file")
+    return (verified is not None and bool(verified.st_ino)
+            and all(os.path.samestat(verified, item)
+                    and (item.st_size, item.st_mtime_ns) == (verified.st_size, verified.st_mtime_ns)
+                    for item in (original, published)))
 
 
 class ArchiveStore:
@@ -698,9 +694,9 @@ class ArchiveStore:
                         try:
                             verified = _copy_verified(source, temporary, *expected)
                             verify_archive_mount(root, expected_source)
-                            if _publish_no_replace(temporary, final):
-                                _verify_published_link(temporary, final, verified)
-                            elif _digest(final) != expected:
+                            linked = _publish_no_replace(temporary, final)
+                            if (not linked or not _matches_published_link(temporary, final, verified)) \
+                                    and _digest(final) != expected:
                                 raise IntegrityError("Existing NAS recording has different content; refusing overwrite")
                             _fsync_dir(final.parent)
                         except BaseException as error:

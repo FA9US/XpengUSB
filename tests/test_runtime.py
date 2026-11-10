@@ -295,14 +295,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("retry scheduled", result["archive"])
         self.assertEqual((15, 1), archive_delay(result, pending=18, failures=0, interval=300))
         self.assertEqual((120, 9), archive_delay(result, pending=18, failures=8, interval=300))
-        original_stat = os.stat
+        original_stat = Path.stat
 
         def root_credentials(path, *args, **kwargs):
             if path == self.config.credentials_file:
                 return SimpleNamespace(st_uid=0, st_mode=0o100600)
             return original_stat(path, *args, **kwargs)
 
-        with patch("xpengusb.runtime.os.stat", side_effect=root_credentials):
+        with patch.object(Path, "stat", root_credentials):
             retried = self.worker.cycle(capture_due=False)
         self.assertEqual("completed", retried["archive"])
         self.assertFalse(self.worker.nas_reconnect_needed)
